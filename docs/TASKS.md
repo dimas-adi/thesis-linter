@@ -12,7 +12,7 @@
 - [x] **T2.2:** Write failing tests and implement `CITATION_ORPHAN`, `DRAFT_TOKEN_ERROR`, `DOUBLE_SPACE_ERROR`, and `FOREIGN_TERM_NOT_ITALIC`.
 - [x] **T2.3:** Write failing tests and implement `src/fixer.rs` (`--fix <output.docx>`) and `src/report.rs` (`--html <report.html>`), verifying via `bash scripts/validate.sh` that fixed documents pass re-linting.
 
-## Phase 3: Native Desktop GUI (`eframe`/`egui`) & `.exe` Packaging (PENDING)
-- [ ] **T3.1:** Add `eframe` (with `glow` backend) and `rfd` to `Cargo.toml`, and create `src/gui.rs` with a testable `DocxLintApp` state struct (active profile, loaded `.docx` path, violation results, filter tab, status banner).
-- [ ] **T3.2:** Implement the GUI panels in `src/gui.rs`: Top toolbar (File picker + Drag-and-drop + Profile switcher), Left settings editor (margins, font, `BAB I` vs `BAB 1` dropdown, Save button), and Central violations table + "Auto-Fix & Save Copy" / "Export HTML" buttons.
-- [ ] **T3.3:** Update `src/main.rs` so running `docx-lint.exe` with 0 arguments launches the native `eframe` desktop GUI, while passing CLI args runs the headless CLI. Add unit tests for `DocxLintApp` state actions and update `scripts/validate.sh` to verify `cargo build --release` succeeds.
+## Phase 3: Native Desktop GUI (`eframe`/`egui`) & `.exe` Packaging (DONE)
+- [x] **T3.1:** Add `eframe` (with `glow` backend) and `rfd` to `Cargo.toml`, and create `src/gui.rs` with a testable `DocxLintApp` state struct (active profile, loaded `.docx` path, violation results, filter tab, status banner).
+- [x] **T3.2:** Implement the GUI panels in `src/gui.rs`: Top toolbar (File picker + Drag-and-drop + Profile switcher), Left settings editor (margins, font, `BAB I` vs `BAB 1` dropdown, Save button), and Central violations table + "Auto-Fix & Save Copy" / "Export HTML" buttons.
+- [x] **T3.3:** Update `src/main.rs` so running `docx-lint.exe` with 0 arguments launches the native `eframe` desktop GUI, while passing CLI args runs the headless CLI. Add unit tests for `DocxLintApp` state actions and update `scripts/validate.sh` to verify `cargo build --release` succeeds.

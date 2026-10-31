@@ -193,3 +193,20 @@ fn parse_like(old: &toml::Value, raw: &str) -> Result<toml::Value> {
 pub fn default_dir() -> &'static Path {
     Path::new("profiles")
 }
+
+impl ProfileStore {
+    /// Sorted names of every `<name>.toml` profile in the directory.
+    pub fn list(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&self.dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                (p.extension()? == "toml").then(|| p.file_stem()?.to_str().map(String::from))?
+            })
+            .collect();
+        names.sort();
+        names
+    }
+}

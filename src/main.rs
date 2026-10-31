@@ -12,7 +12,7 @@ struct Cli {
     #[arg(long, global = true)]
     profiles_dir: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -56,7 +56,10 @@ enum ConfigAction {
 
 fn run(cli: Cli) -> Result<bool> {
     let store = ProfileStore::new(cli.profiles_dir.unwrap_or_else(|| default_dir().into()));
-    match cli.command {
+    let Some(command) = cli.command else {
+        unreachable!("GUI mode is handled in main")
+    };
+    match command {
         Command::Config { action } => {
             match action {
                 ConfigAction::Init { name } => {
@@ -128,6 +131,16 @@ fn print_violations(violations: &[linter::Violation]) {
 }
 
 fn main() -> ExitCode {
+    // WHY: 0 args (double-click) means GUI; any args mean headless CLI.
+    if std::env::args_os().len() <= 1 {
+        return match docx_lint::gui::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
     match run(Cli::parse()) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(1),
