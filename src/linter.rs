@@ -16,7 +16,7 @@ pub struct Violation {
     pub paragraph: usize,
 }
 
-fn v(code: &str, message: String, paragraph: usize) -> Violation {
+pub(crate) fn v(code: &str, message: String, paragraph: usize) -> Violation {
     Violation {
         code: code.into(),
         message,
@@ -39,7 +39,7 @@ pub fn lint_file(path: &Path, cfg: &ProfileConfig) -> Result<Vec<Violation>> {
     lint_xml(&read_document_xml(path)?, cfg)
 }
 
-fn attr(e: &BytesStart, name: &str) -> Option<String> {
+pub(crate) fn attr(e: &BytesStart, name: &str) -> Option<String> {
     e.attributes()
         .flatten()
         .find(|a| a.key.local_name().as_ref() == name)
@@ -155,5 +155,6 @@ pub fn lint_xml(xml: &str, cfg: &ProfileConfig) -> Result<Vec<Violation>> {
             _ => {}
         }
     }
+    crate::structure::check(xml, cfg, &mut out)?;
     Ok(out)
 }

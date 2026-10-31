@@ -47,3 +47,72 @@ pub fn write_docx(path: &Path, document: &str) {
     }
     zip.finish().unwrap();
 }
+
+/// Body paragraph that satisfies the default profile's font/size/spacing rules.
+pub fn good_para(text: &str) -> String {
+    format!(
+        "<w:p><w:pPr><w:spacing w:line=\"360\" w:lineRule=\"auto\"/></w:pPr>\
+<w:r><w:rPr><w:rFonts w:ascii=\"Times New Roman\" w:hAnsi=\"Times New Roman\"/><w:sz w:val=\"24\"/></w:rPr>\
+<w:t xml:space=\"preserve\">{text}</w:t></w:r></w:p>"
+    )
+}
+
+/// Chapter-style heading (heading style, so the body size rule is skipped).
+pub fn heading_para(text: &str, jc: &str) -> String {
+    format!(
+        "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/><w:jc w:val=\"{jc}\"/></w:pPr>\
+<w:r><w:rPr><w:rFonts w:ascii=\"Times New Roman\" w:hAnsi=\"Times New Roman\"/></w:rPr><w:t>{text}</w:t></w:r></w:p>"
+    )
+}
+
+/// Paragraph made of runs with an explicit italic flag, otherwise default-profile formatting.
+pub fn run_para(runs: &[(&str, bool)]) -> String {
+    let rs: String = runs
+        .iter()
+        .map(|(t, it)| {
+            format!(
+                "<w:r><w:rPr><w:rFonts w:ascii=\"Times New Roman\" w:hAnsi=\"Times New Roman\"/>{}<w:sz w:val=\"24\"/></w:rPr>\
+<w:t xml:space=\"preserve\">{t}</w:t></w:r>",
+                if *it { "<w:i/>" } else { "" }
+            )
+        })
+        .collect();
+    format!("<w:p><w:pPr><w:spacing w:line=\"360\" w:lineRule=\"auto\"/></w:pPr>{rs}</w:p>")
+}
+
+/// Writes `body` to `<dir>/t.docx` and runs `docx-lint check --json` on it.
+pub fn lint_body(dir: &Path, body: &str, extra: &[&str]) -> (bool, serde_json::Value) {
+    let docx = dir.join("t.docx");
+    write_docx(&docx, &document_xml(body));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_docx-lint"))
+        .current_dir(dir)
+        .arg("check")
+        .arg(&docx)
+        .arg("--json")
+        .args(extra)
+        .output()
+        .unwrap();
+    let json = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
+    (out.status.success(), json)
+}
+
+pub fn viol_codes(v: &serde_json::Value) -> Vec<String> {
+    v["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["code"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Runs `docx-lint config ...` in `dir`.
+pub fn config(dir: &Path, args: &[&str]) {
+    let st = std::process::Command::new(env!("CARGO_BIN_EXE_docx-lint"))
+        .current_dir(dir)
+        .arg("config")
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(st.success());
+}

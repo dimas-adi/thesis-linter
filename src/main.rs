@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use docx_lint::config::{ProfileStore, default_dir};
-use docx_lint::linter;
+use docx_lint::{fixer, linter, report};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -29,6 +29,12 @@ enum Command {
         profile: Option<String>,
         #[arg(long)]
         json: bool,
+        /// Write an auto-fixed copy of the document here
+        #[arg(long)]
+        fix: Option<PathBuf>,
+        /// Write an HTML report here
+        #[arg(long)]
+        html: Option<PathBuf>,
     },
 }
 
@@ -72,25 +78,52 @@ fn run(cli: Cli) -> Result<bool> {
             file,
             profile,
             json,
+            fix,
+            html,
         } => {
             let cfg = store.resolve(profile.as_deref())?;
             let violations = linter::lint_file(&file, &cfg)?;
+            if let Some(path) = &html {
+                let page = report::render_html(&file.display().to_string(), &cfg, &violations);
+                std::fs::write(path, page)?;
+            }
+            // WHY: with --fix the exit code reflects what is left in the fixed copy.
+            let remaining = match &fix {
+                Some(out) => {
+                    fixer::fix_file(&file, out, &cfg)?;
+                    Some(linter::lint_file(out, &cfg)?)
+                }
+                None => None,
+            };
             if json {
-                let doc = serde_json::json!({
+                let mut doc = serde_json::json!({
                     "file": file.display().to_string(),
                     "profile": cfg.profile_name,
                     "violations": violations,
                 });
+                if let (Some(rem), Some(out)) = (&remaining, &fix) {
+                    doc["fixed_file"] = out.display().to_string().into();
+                    doc["remaining"] = serde_json::to_value(rem)?;
+                }
                 println!("{}", serde_json::to_string_pretty(&doc)?);
-            } else if violations.is_empty() {
-                println!("OK: no violations");
             } else {
-                for x in &violations {
-                    println!("[{}] (para {}) {}", x.code, x.paragraph, x.message);
+                print_violations(&violations);
+                if let (Some(rem), Some(out)) = (&remaining, &fix) {
+                    println!("fixed copy: {} ({} remaining)", out.display(), rem.len());
+                    print_violations(rem);
                 }
             }
-            Ok(violations.is_empty())
+            Ok(remaining.as_ref().unwrap_or(&violations).is_empty())
         }
+    }
+}
+
+fn print_violations(violations: &[linter::Violation]) {
+    if violations.is_empty() {
+        println!("OK: no violations");
+    }
+    for x in violations {
+        println!("[{}] (para {}) {}", x.code, x.paragraph, x.message);
     }
 }
 
