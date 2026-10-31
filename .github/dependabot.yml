@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # Maintain dependencies for Cargo (Rust)
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "Asia/Jakarta"
+    open-pull-requests-limit: 5
+    # Optional: Group minor/patch updates into a single PR to prevent PR spam
+    groups:
+      rust-crates:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"

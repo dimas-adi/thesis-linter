@@ -1,0 +1,18 @@
+# Active Tasks Checklist
+
+## Phase 1: Rust Scaffolding, Profile Config & Layout/Font Linter (ACTIVE)
+- [ ] **T1.1:** Initialize `Cargo.toml` (`zip`, `quick-xml`, `serde`, `toml`, `serde_json`, `clap`, `anyhow`, `tempfile`) and create `scripts/validate.sh` (`cargo fmt --check && cargo clippy -- -D warnings && cargo test`).
+- [ ] **T1.2:** Implement `src/config.rs` with `ProfileConfig` structs and `docx-lint config` subcommands (`init`, `set`, `use`, `show`) storing `.toml` presets in `./profiles/`.
+- [ ] **T1.3:** Create synthetic `.docx` test builder helper in `tests/common/mod.rs` that packs custom `word/document.xml` strings into valid `.docx` ZIP archives.
+- [ ] **T1.4:** Implement streaming `quick-xml` parser in `src/linter.rs` for `MARGIN_ERROR` (twips to cm), `FONT_ERROR`, and `SPACING_ERROR`, driven dynamically by `ProfileConfig`.
+- [ ] **T1.5:** Wire up `docx-lint check <file> [--profile] [--json]` in `src/main.rs` and verify all Phase 1 tests pass via `bash scripts/validate.sh`.
+
+## Phase 2: Dynamic Structure, Citations, HTML Report & `--fix` Engine (PENDING)
+- [ ] **T2.1:** Write failing tests and implement `HEADING_ERROR` (`roman` vs `arabic` chapters) and per-chapter `CAPTION_SEQ_ERROR` (`.` vs `-` separators) in `src/linter.rs`.
+- [ ] **T2.2:** Write failing tests and implement `CITATION_ORPHAN`, `DRAFT_TOKEN_ERROR`, `DOUBLE_SPACE_ERROR`, and `FOREIGN_TERM_NOT_ITALIC`.
+- [ ] **T2.3:** Write failing tests and implement `src/fixer.rs` (`--fix <output.docx>`) and `src/report.rs` (`--html <report.html>`), verifying via `bash scripts/validate.sh` that fixed documents pass re-linting.
+
+## Phase 3: Native Desktop GUI (`eframe`/`egui`) & `.exe` Packaging (PENDING)
+- [ ] **T3.1:** Add `eframe` (with `glow` backend) and `rfd` to `Cargo.toml`, and create `src/gui.rs` with a testable `DocxLintApp` state struct (active profile, loaded `.docx` path, violation results, filter tab, status banner).
+- [ ] **T3.2:** Implement the GUI panels in `src/gui.rs`: Top toolbar (File picker + Drag-and-drop + Profile switcher), Left settings editor (margins, font, `BAB I` vs `BAB 1` dropdown, Save button), and Central violations table + "Auto-Fix & Save Copy" / "Export HTML" buttons.
+- [ ] **T3.3:** Update `src/main.rs` so running `docx-lint.exe` with 0 arguments launches the native `eframe` desktop GUI, while passing CLI args runs the headless CLI. Add unit tests for `DocxLintApp` state actions and update `scripts/validate.sh` to verify `cargo build --release` succeeds.
