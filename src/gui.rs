@@ -49,6 +49,8 @@ pub struct DocxLintApp {
     pub violations: Vec<Violation>,
     pub filter: FilterTab,
     pub status: String,
+    /// Editable text of `profiles/foreign_terms.txt` (one word per line).
+    pub dictionary_text: String,
 }
 
 impl DocxLintApp {
@@ -60,8 +62,10 @@ impl DocxLintApp {
                 format!("Error: {e:#}"),
             ),
         };
+        let dictionary_text = store.load_dictionary().join("\n");
         let mut app = DocxLintApp {
             store,
+            dictionary_text,
             profile,
             profile_names: Vec::new(),
             docx_path: None,
@@ -125,6 +129,24 @@ impl DocxLintApp {
             }
             Err(e) => self.error(e),
         }
+    }
+
+    /// Writes `dictionary_text` to `foreign_terms.txt` and swaps the old words for the new ones.
+    pub fn save_dictionary(&mut self) {
+        let old = self.store.load_dictionary();
+        if let Err(e) = self.store.save_dictionary(&self.dictionary_text) {
+            return self.error(e);
+        }
+        let terms = &mut self.profile.academic.foreign_terms_must_italicize;
+        // WHY: drop only words that came from the old file so terms typed into the profile survive.
+        terms.retain(|t| !old.iter().any(|o| o.eq_ignore_ascii_case(t)));
+        for w in self.store.load_dictionary() {
+            if !terms.iter().any(|t| t.eq_ignore_ascii_case(&w)) {
+                terms.push(w);
+            }
+        }
+        self.recheck();
+        self.status = format!("Saved dictionary. {}", self.status);
     }
 
     pub fn switch_profile(&mut self, name: &str) {
@@ -289,6 +311,16 @@ impl DocxLintApp {
                     );
                 });
         });
+        ui.separator();
+        ui.label("Foreign-term dictionary (one word per line)");
+        ui.add(
+            egui::TextEdit::multiline(&mut self.dictionary_text)
+                .desired_rows(6)
+                .desired_width(f32::INFINITY),
+        );
+        if ui.button("Save dictionary").clicked() {
+            self.save_dictionary();
+        }
         if ui.button("Save profile").clicked() {
             self.save_profile();
         }

@@ -63,6 +63,9 @@ pub fn lint_xml(xml: &str, cfg: &ProfileConfig) -> Result<Vec<Violation>> {
     let (mut in_ppr, mut in_rpr) = (false, false);
     let mut heading = false;
     let tol = cfg.page.tolerance_cm;
+    // WHY: front-matter/table membership needs whole-document knowledge, so compute it up front.
+    let ctx = crate::structure::para_context(xml, cfg)?;
+    let mut cur = crate::structure::Ctx::default();
 
     loop {
         let ev = reader.read_event().context("malformed document.xml")?;
@@ -84,6 +87,7 @@ pub fn lint_xml(xml: &str, cfg: &ProfileConfig) -> Result<Vec<Violation>> {
             "p" => {
                 para += 1;
                 heading = false;
+                cur = ctx.get(para - 1).copied().unwrap_or_default();
             }
             "pPr" if is_start => in_ppr = true,
             "rPr" if is_start => in_rpr = true,
@@ -127,7 +131,7 @@ pub fn lint_xml(xml: &str, cfg: &ProfileConfig) -> Result<Vec<Violation>> {
             "sz" if in_rpr && !heading => {
                 if let Some(half) = attr_f64(e, "val") {
                     let pt = half / 2.0;
-                    if (pt - cfg.typography.body_size_pt).abs() > 0.01 {
+                    if !cur.size_ok(pt, cfg) {
                         out.push(v(
                             "FONT_ERROR",
                             format!("size {pt} pt, expected {} pt", cfg.typography.body_size_pt),
@@ -140,7 +144,7 @@ pub fn lint_xml(xml: &str, cfg: &ProfileConfig) -> Result<Vec<Violation>> {
                 let auto = attr(e, "lineRule").is_none_or(|r| r == "auto");
                 if let (Some(line), true) = (attr_f64(e, "line"), auto) {
                     let ratio = line / 240.0;
-                    if (ratio - cfg.typography.line_spacing).abs() > 0.01 {
+                    if !cur.spacing_ok(ratio, cfg) {
                         out.push(v(
                             "SPACING_ERROR",
                             format!(

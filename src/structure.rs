@@ -13,6 +13,9 @@ pub struct Run {
 pub struct Para {
     pub jc: Option<String>,
     pub runs: Vec<Run>,
+    pub in_table: bool,
+    /// Heading1 paragraph whose "BAB n" label comes from automatic list numbering.
+    pub auto_chapter: bool,
 }
 
 impl Para {
@@ -27,6 +30,7 @@ pub fn parse_paragraphs(xml: &str) -> Result<Vec<Para>> {
     let mut paras = Vec::new();
     let (mut cur, mut run): (Option<Para>, Option<Run>) = (None, None);
     let (mut in_ppr, mut in_rpr, mut in_t) = (false, false, false);
+    let mut tbl_depth = 0usize;
     loop {
         let ev = reader.read_event().context("malformed document.xml")?;
         let (e, is_start) = match &ev {
@@ -65,6 +69,7 @@ pub fn parse_paragraphs(xml: &str) -> Result<Vec<Para>> {
                     "pPr" => in_ppr = false,
                     "rPr" => in_rpr = false,
                     "t" => in_t = false,
+                    "tbl" => tbl_depth = tbl_depth.saturating_sub(1),
                     _ => {}
                 }
                 continue;
@@ -72,10 +77,14 @@ pub fn parse_paragraphs(xml: &str) -> Result<Vec<Para>> {
             _ => continue,
         };
         match e.local_name().as_ref() {
+            // WHY: tables can nest, so a depth counter (not a bool) tells us when we leave the outer one.
+            "tbl" if is_start => tbl_depth += 1,
             "p" => {
                 let p = Para {
                     jc: None,
                     runs: Vec::new(),
+                    in_table: tbl_depth > 0,
+                    auto_chapter: false,
                 };
                 if is_start {
                     cur = Some(p);
@@ -93,6 +102,35 @@ pub fn parse_paragraphs(xml: &str) -> Result<Vec<Para>> {
             "pPr" if is_start => in_ppr = true,
             "rPr" if is_start => in_rpr = true,
             "t" if is_start => in_t = true,
+            "pStyle" if in_ppr => {
+                if let Some(p) = cur.as_mut() {
+                    p.auto_chapter =
+                        attr(e, "val").is_some_and(|s| s.eq_ignore_ascii_case("heading1"));
+                }
+            }
+            // WHY: numId 0 switches list numbering off ("Daftar Isi" etc.), so it is not a chapter.
+            "numId" if in_ppr && attr(e, "val").as_deref() == Some("0") => {
+                if let Some(p) = cur.as_mut() {
+                    p.auto_chapter = false;
+                }
+            }
+            // WHY: a line break/tab splits "BAB I<br/>PENDAHULUAN"; without a separator the chapter token is lost.
+            "br" | "tab" | "cr" if !in_rpr => {
+                // WHY: tabs often sit in separate runs; check the whole paragraph so they never fake a double space.
+                let prev_ws = cur.as_ref().is_none_or(|p| {
+                    p.runs
+                        .iter()
+                        .rev()
+                        .find_map(|r| r.text.chars().last())
+                        .is_none_or(char::is_whitespace)
+                });
+                if let Some(r) = run.as_mut() {
+                    let ws = r.text.chars().last().map_or(prev_ws, char::is_whitespace);
+                    if !ws {
+                        r.text.push(' ');
+                    }
+                }
+            }
             "jc" if in_ppr => {
                 if let Some(p) = cur.as_mut() {
                     p.jc = attr(e, "val");
@@ -236,16 +274,100 @@ fn parse_citation(part: &str) -> Option<(String, String)> {
     valid.then(|| (author, year.to_string()))
 }
 
-fn contains_word(hay: &str, word: &str) -> bool {
-    hay.match_indices(word).any(|(i, _)| {
-        let before = hay[..i].chars().next_back();
-        let after = hay[i + word.len()..].chars().next();
-        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
-    })
+/// Byte ranges of case-insensitive, whole-word (`\b`-style) occurrences of `word` in `hay`.
+pub(crate) fn find_words(hay: &str, word: &str) -> Vec<(usize, usize)> {
+    // WHY: lowercase char-by-char (1:1) so indices into `chars` still map to byte offsets of `hay`.
+    let low = |c: char| c.to_lowercase().next().unwrap_or(c);
+    let w: Vec<char> = word.chars().map(low).collect();
+    let chars: Vec<(usize, char)> = hay.char_indices().collect();
+    let mut out = Vec::new();
+    if w.is_empty() {
+        return out;
+    }
+    let mut i = 0;
+    while i + w.len() <= chars.len() {
+        let hit = chars[i..i + w.len()]
+            .iter()
+            .zip(&w)
+            .all(|((_, c), x)| low(*c) == *x);
+        let before_ok = i == 0 || !chars[i - 1].1.is_alphanumeric();
+        let after_ok = chars
+            .get(i + w.len())
+            .is_none_or(|(_, c)| !c.is_alphanumeric());
+        if hit && before_ok && after_ok {
+            let end = chars.get(i + w.len()).map_or(hay.len(), |(b, _)| *b);
+            out.push((chars[i].0, end));
+            i += w.len();
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Chapter number token if `text` is a real chapter heading (not a table-of-contents line).
+fn chapter_token<'a>(text: &'a str, cfg: &ProfileConfig) -> Option<&'a str> {
+    let rest = after_prefix(text.trim_start(), &cfg.structure.chapter_prefix)?;
+    let tok = rest
+        .split_whitespace()
+        .next()
+        .filter(|t| is_chapter_token(t))?;
+    let last = rest.split_whitespace().last().unwrap_or("");
+    // WHY: "BAB I PENDAHULUAN ....... 1" in DAFTAR ISI must not count as the chapter start.
+    let toc = rest.contains("...")
+        || (rest.split_whitespace().count() > 1 && last.chars().all(|c| c.is_ascii_digit()));
+    (!toc).then_some(tok)
+}
+
+/// Index of the first real chapter heading, if the document has one.
+fn first_chapter(paras: &[Para], cfg: &ProfileConfig) -> Option<usize> {
+    paras
+        .iter()
+        .position(|p| p.auto_chapter || chapter_token(&p.text(), cfg).is_some())
+}
+
+/// Per-paragraph context used to relax font/spacing rules.
+#[derive(Clone, Copy, Default)]
+pub struct Ctx {
+    pub front: bool,
+    pub table: bool,
+}
+
+impl Ctx {
+    pub fn size_ok(self, pt: f64, cfg: &ProfileConfig) -> bool {
+        let mut allowed = vec![cfg.typography.body_size_pt];
+        if self.front {
+            allowed.extend([12.0, 14.0, 16.0]);
+        }
+        if self.table {
+            allowed.extend([10.0, 11.0]);
+        }
+        allowed.iter().any(|a| (pt - a).abs() <= 0.01)
+    }
+
+    pub fn spacing_ok(self, ratio: f64, cfg: &ProfileConfig) -> bool {
+        (ratio - cfg.typography.line_spacing).abs() <= 0.01
+            || (self.table && (ratio - 1.0).abs() <= 0.01)
+    }
+}
+
+/// One `Ctx` per paragraph, in the same order the streaming linter/fixer count `<w:p>`.
+pub fn para_context(xml: &str, cfg: &ProfileConfig) -> Result<Vec<Ctx>> {
+    let paras = parse_paragraphs(xml)?;
+    let first = first_chapter(&paras, cfg);
+    Ok(paras
+        .iter()
+        .enumerate()
+        .map(|(i, p)| Ctx {
+            front: first.is_some_and(|f| i < f),
+            table: p.in_table,
+        })
+        .collect())
 }
 
 pub fn check(xml: &str, cfg: &ProfileConfig, out: &mut Vec<Violation>) -> Result<()> {
     let paras = parse_paragraphs(xml)?;
+    let first = first_chapter(&paras, cfg);
     let s = &cfg.structure;
     let bib = paras
         .iter()
@@ -261,6 +383,7 @@ pub fn check(xml: &str, cfg: &ProfileConfig, out: &mut Vec<Violation>) -> Result
 
     let mut chapter: Option<u32> = None;
     let mut seq = [0u32; 2];
+    let mut auto_n = 0u32;
     let captions = [&s.figure_prefix, &s.table_prefix];
 
     for (idx, p) in paras.iter().enumerate() {
@@ -268,11 +391,11 @@ pub fn check(xml: &str, cfg: &ProfileConfig, out: &mut Vec<Violation>) -> Result
         let text = p.text();
         let trimmed = text.trim_start();
         let in_body = bib.is_none_or(|b| idx < b);
+        let front = first.is_some_and(|f| idx < f);
 
         // HEADING_ERROR: chapter number style and alignment.
-        if let Some(rest) = after_prefix(trimmed, &s.chapter_prefix) {
-            let tok = rest.split_whitespace().next().unwrap_or("");
-            if is_chapter_token(tok) {
+        {
+            if let Some(tok) = chapter_token(trimmed, cfg) {
                 let arabic = s.chapter_numbering == "arabic";
                 let valid = if arabic {
                     tok.chars().all(|c| c.is_ascii_digit())
@@ -312,9 +435,18 @@ pub fn check(xml: &str, cfg: &ProfileConfig, out: &mut Vec<Violation>) -> Result
                 seq = [0; 2];
             }
         }
+        if p.auto_chapter && chapter_token(trimmed, cfg).is_none() {
+            auto_n += 1;
+            chapter = Some(auto_n);
+            seq = [0; 2];
+        }
 
         // CAPTION_SEQ_ERROR: separator, chapter number and running sequence per chapter.
         for (kind, prefix) in captions.iter().enumerate() {
+            // WHY: DAFTAR GAMBAR / DAFTAR TABEL entries before BAB I are not real captions.
+            if front {
+                break;
+            }
             let Some((c, sep, k)) = after_prefix(trimmed, prefix).and_then(parse_caption_number)
             else {
                 continue;
@@ -349,9 +481,8 @@ pub fn check(xml: &str, cfg: &ProfileConfig, out: &mut Vec<Violation>) -> Result
         }
 
         // DRAFT_TOKEN_ERROR
-        let lower = text.to_lowercase();
         for tok in &cfg.academic.forbidden_tokens {
-            if !tok.is_empty() && lower.contains(&tok.to_lowercase()) {
+            if !find_words(&text, tok).is_empty() {
                 out.push(v(
                     "DRAFT_TOKEN_ERROR",
                     format!("draft marker '{tok}' found"),
@@ -367,11 +498,9 @@ pub fn check(xml: &str, cfg: &ProfileConfig, out: &mut Vec<Violation>) -> Result
 
         // FOREIGN_TERM_NOT_ITALIC
         for term in &cfg.academic.foreign_terms_must_italicize {
-            let t = term.to_lowercase();
-            if !t.is_empty()
-                && p.runs
-                    .iter()
-                    .any(|r| !r.italic && contains_word(&r.text.to_lowercase(), &t))
+            if p.runs
+                .iter()
+                .any(|r| !r.italic && !find_words(&r.text, term).is_empty())
             {
                 out.push(v(
                     "FOREIGN_TERM_NOT_ITALIC",

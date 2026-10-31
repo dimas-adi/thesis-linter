@@ -16,3 +16,12 @@
 - [x] **T3.1:** Add `eframe` (with `glow` backend) and `rfd` to `Cargo.toml`, and create `src/gui.rs` with a testable `DocxLintApp` state struct (active profile, loaded `.docx` path, violation results, filter tab, status banner).
 - [x] **T3.2:** Implement the GUI panels in `src/gui.rs`: Top toolbar (File picker + Drag-and-drop + Profile switcher), Left settings editor (margins, font, `BAB I` vs `BAB 1` dropdown, Save button), and Central violations table + "Auto-Fix & Save Copy" / "Export HTML" buttons.
 - [x] **T3.3:** Update `src/main.rs` so running `docx-lint.exe` with 0 arguments launches the native `eframe` desktop GUI, while passing CLI args runs the headless CLI. Add unit tests for `DocxLintApp` state actions and update `scripts/validate.sh` to verify `cargo build --release` succeeds.
+
+## Phase 4: Real-World Thesis Fixes & Run-Splitting Auto-Fixer (DONE)
+- [x] **T4.1 (Regex Word Boundaries):** In `src/structure.rs`, enforce `\b` word boundaries for `forbidden_tokens` (matching whole words like `\bTODO\b` case-insensitively) so words like "METODOLOGI" are never flagged.
+- [x] **T4.2 (Exempt Front Matter & Tables from 12pt/1.5):** 
+  - Exempt paragraphs before the first Chapter heading (`BAB I` / `BAB 1`) from strict 12pt checks (allow 12pt, 14pt, or 16pt for Title/Cover).
+  - Detect paragraphs inside tables (`<w:tbl>`) and exempt them from 12pt font and 1.5 line spacing (allow 10pt/11pt and 1.0 spacing).
+- [x] **T4.3 (Front Matter Caption Exemption & Per-Chapter Reset):** Ignore caption sequence checks before the first Chapter heading (skipping `DAFTAR GAMBAR` / `DAFTAR TABEL`), and ensure caption sequence numbers strictly reset to 1 for each new chapter.
+- [x] **T4.4 (External Vocabulary Dictionary):** Support an external dictionary file at `./profiles/foreign_terms.txt` (merging it with `foreign_terms_must_italicize`), and add an input box in the GUI settings panel to add/edit words.
+- [x] **T4.5 (Run-Splitting Italic Fixer):** In `src/fixer.rs`, implement OpenXML run-splitting for `FOREIGN_TERM_NOT_ITALIC` so un-italicized foreign words are split into isolated `<w:r>` runs containing `<w:rPr><w:i/></w:rPr>`. Add tests in `tests/` proving re-linting a fixed document brings foreign term violations to 0.

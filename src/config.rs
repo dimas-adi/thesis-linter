@@ -113,7 +113,13 @@ impl ProfileStore {
     pub fn save(&self, cfg: &ProfileConfig) -> Result<()> {
         let path = self.path(&cfg.profile_name)?;
         std::fs::create_dir_all(&self.dir)?;
-        std::fs::write(&path, toml::to_string_pretty(cfg)?)
+        // WHY: dictionary words were merged in on load; writing them back would duplicate the file's content.
+        let dict = self.load_dictionary();
+        let mut own = cfg.clone();
+        own.academic
+            .foreign_terms_must_italicize
+            .retain(|t| !dict.iter().any(|d| d.eq_ignore_ascii_case(t)));
+        std::fs::write(&path, toml::to_string_pretty(&own)?)
             .with_context(|| format!("writing {}", path.display()))
     }
 
@@ -121,7 +127,36 @@ impl ProfileStore {
         let path = self.path(name)?;
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("profile '{name}' not found at {}", path.display()))?;
-        Ok(toml::from_str(&text)?)
+        Ok(self.with_dictionary(toml::from_str(&text)?))
+    }
+
+    fn with_dictionary(&self, mut cfg: ProfileConfig) -> ProfileConfig {
+        let terms = &mut cfg.academic.foreign_terms_must_italicize;
+        for w in self.load_dictionary() {
+            if !terms.iter().any(|t| t.eq_ignore_ascii_case(&w)) {
+                terms.push(w);
+            }
+        }
+        cfg
+    }
+
+    fn dictionary_path(&self) -> PathBuf {
+        self.dir.join("foreign_terms.txt")
+    }
+
+    /// Words from `foreign_terms.txt` (one per line; blank lines and `#` comments ignored).
+    pub fn load_dictionary(&self) -> Vec<String> {
+        let text = std::fs::read_to_string(self.dictionary_path()).unwrap_or_default();
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(String::from)
+            .collect()
+    }
+
+    pub fn save_dictionary(&self, text: &str) -> Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        std::fs::write(self.dictionary_path(), text).context("writing foreign_terms.txt")
     }
 
     pub fn init(&self, name: &str) -> Result<ProfileConfig> {
@@ -146,7 +181,7 @@ impl ProfileStore {
     pub fn resolve(&self, name: Option<&str>) -> Result<ProfileConfig> {
         match name.map(String::from).or_else(|| self.active_name()) {
             Some(n) => self.load(&n),
-            None => Ok(ProfileConfig::default_named("default_kampus")),
+            None => Ok(self.with_dictionary(ProfileConfig::default_named("default_kampus"))),
         }
     }
 
