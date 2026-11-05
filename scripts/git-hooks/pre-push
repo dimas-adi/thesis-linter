@@ -1,0 +1,8 @@
+#!/bin/sh
+# loop-kit guard: agents never push. Only the human pushes.
+# WHY: each harness sets its own marker only in commands its agent runs: Claude Code sets
+# CLAUDE_CODE_CHILD_SESSION=1, Antigravity sets ANTIGRAVITY_AGENT=1.
+if [ "${CLAUDE_CODE_CHILD_SESSION:-}" = "1" ] || [ "${ANTIGRAVITY_AGENT:-}" = "1" ]; then
+  echo "loop-kit: blocked. Agents never push; only the human pushes." >&2
+  exit 1
+fi

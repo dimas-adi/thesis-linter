@@ -34,3 +34,14 @@ ehthumbs_vista.db
 [Dd]esktop.ini
 $RECYCLE.BIN/
 .DS_Store
+
+# Loop workflow
+scripts/validate.local.env
+scripts/validate.local.env.example
+docs/archive/
+docs/_loop-templates
+.env
+.env.*
+!.env.example
+.claude
+.agents
