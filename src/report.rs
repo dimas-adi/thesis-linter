@@ -5,9 +5,7 @@ use std::collections::BTreeMap;
 
 fn esc(s: &str) -> String {
     // WHY: messages contain document text (font names etc.), so escape before embedding in HTML.
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    crate::structure::escape_text(s)
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
 }

@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use docx_lint::config::{ProfileStore, default_dir};
 use docx_lint::{fixer, linter, report};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -12,7 +13,7 @@ struct Cli {
     #[arg(long, global = true)]
     profiles_dir: Option<PathBuf>,
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Subcommand)]
@@ -56,24 +57,21 @@ enum ConfigAction {
 
 fn run(cli: Cli) -> Result<bool> {
     let store = ProfileStore::new(cli.profiles_dir.unwrap_or_else(|| default_dir().into()));
-    let Some(command) = cli.command else {
-        unreachable!("GUI mode is handled in main")
-    };
-    match command {
+    let mut out = std::io::stdout().lock();
+    match cli.command {
         Command::Config { action } => {
             match action {
                 ConfigAction::Init { name } => {
                     store.init(&name)?;
-                    println!("created profile '{name}'");
+                    writeln!(out, "created profile '{name}'")?;
                 }
                 ConfigAction::Set { name, key, value } => store.set_value(&name, &key, &value)?,
                 ConfigAction::Use { name } => store.set_active(&name)?,
-                ConfigAction::Show { name } => {
-                    print!(
-                        "{}",
-                        toml::to_string_pretty(&store.resolve(name.as_deref())?)?
-                    )
-                }
+                ConfigAction::Show { name } => write!(
+                    out,
+                    "{}",
+                    toml::to_string_pretty(&store.resolve(name.as_deref())?)?
+                )?,
             }
             Ok(true)
         }
@@ -87,6 +85,7 @@ fn run(cli: Cli) -> Result<bool> {
             let cfg = store.resolve(profile.as_deref())?;
             let violations = linter::lint_file(&file, &cfg)?;
             if let Some(path) = &html {
+                fixer::ensure_distinct(&file, path)?;
                 let page = report::render_html(&file.display().to_string(), &cfg, &violations);
                 std::fs::write(path, page)?;
             }
@@ -104,16 +103,21 @@ fn run(cli: Cli) -> Result<bool> {
                     "profile": cfg.profile_name,
                     "violations": violations,
                 });
-                if let (Some(rem), Some(out)) = (&remaining, &fix) {
-                    doc["fixed_file"] = out.display().to_string().into();
+                if let (Some(rem), Some(path)) = (&remaining, &fix) {
+                    doc["fixed_file"] = path.display().to_string().into();
                     doc["remaining"] = serde_json::to_value(rem)?;
                 }
-                println!("{}", serde_json::to_string_pretty(&doc)?);
+                writeln!(out, "{}", serde_json::to_string_pretty(&doc)?)?;
             } else {
-                print_violations(&violations);
-                if let (Some(rem), Some(out)) = (&remaining, &fix) {
-                    println!("fixed copy: {} ({} remaining)", out.display(), rem.len());
-                    print_violations(rem);
+                print_violations(&mut out, &violations)?;
+                if let (Some(rem), Some(path)) = (&remaining, &fix) {
+                    writeln!(
+                        out,
+                        "fixed copy: {} ({} remaining)",
+                        path.display(),
+                        rem.len()
+                    )?;
+                    print_violations(&mut out, rem)?;
                 }
             }
             Ok(remaining.as_ref().unwrap_or(&violations).is_empty())
@@ -121,13 +125,14 @@ fn run(cli: Cli) -> Result<bool> {
     }
 }
 
-fn print_violations(violations: &[linter::Violation]) {
+fn print_violations(out: &mut impl Write, violations: &[linter::Violation]) -> std::io::Result<()> {
     if violations.is_empty() {
-        println!("OK: no violations");
+        writeln!(out, "OK: no violations")?;
     }
     for x in violations {
-        println!("[{}] (para {}) {}", x.code, x.paragraph, x.message);
+        writeln!(out, "[{}] (para {}) {}", x.code, x.paragraph, x.message)?;
     }
+    Ok(())
 }
 
 fn main() -> ExitCode {

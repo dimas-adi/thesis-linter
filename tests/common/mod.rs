@@ -8,7 +8,7 @@ const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main
 pub fn document_xml(body: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-<w:document xmlns:w=\"{W_NS}\"><w:body>{body}</w:body></w:document>"
+<w:document xmlns:w=\"{W_NS}\" xmlns:v=\"urn:schemas-microsoft-com:vml\" \nxmlns:m=\"http://schemas.openxmlformats.org/officeDocument/2006/math\" \nxmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" \nxmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" \nxmlns:wps=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\"><w:body>{body}</w:body></w:document>"
     )
 }
 
@@ -115,4 +115,41 @@ pub fn config(dir: &Path, args: &[&str]) {
         .status()
         .unwrap();
     assert!(st.success());
+}
+
+/// Packs `body` into `<dir>/in.docx`, runs `check --fix out.docx --json`, and returns the JSON
+/// result with the fixed `word/document.xml`.
+pub fn fix_body(dir: &Path, body: &str) -> (serde_json::Value, String) {
+    use std::io::Read;
+    write_docx(&dir.join("in.docx"), &document_xml(body));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_docx-lint"))
+        .current_dir(dir)
+        .args(["check", "in.docx", "--fix", "out.docx", "--json"])
+        .output()
+        .unwrap();
+    let json = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stderr)));
+    let mut xml = String::new();
+    zip::ZipArchive::new(std::fs::File::open(dir.join("out.docx")).unwrap())
+        .unwrap()
+        .by_name("word/document.xml")
+        .unwrap()
+        .read_to_string(&mut xml)
+        .unwrap();
+    (json, xml)
+}
+
+/// `(code, paragraph)` pairs of a `check --json` result.
+pub fn viol_pairs(v: &serde_json::Value, key: &str) -> Vec<(String, u64)> {
+    v[key]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| {
+            (
+                x["code"].as_str().unwrap().to_string(),
+                x["paragraph"].as_u64().unwrap(),
+            )
+        })
+        .collect()
 }

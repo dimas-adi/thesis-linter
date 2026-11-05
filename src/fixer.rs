@@ -1,37 +1,85 @@
 //! Rewrites `word/document.xml` so mechanically fixable violations disappear.
 use crate::config::ProfileConfig;
-use crate::linter::attr;
-use crate::structure::{Ctx, find_words, para_context};
+use crate::linter::{MAX_DOCUMENT_XML_BYTES, attr, read_limited};
+use crate::structure::{
+    Ctx, Ns, TWIPS_PER_CM, contexts, escape_text, find_words, is_heading_style, margin_off,
+    parse_document, resolve_ref,
+};
 use anyhow::{Context, Result, bail};
 use quick_xml::events::{BytesStart, BytesText, Event};
-use quick_xml::{Reader, Writer};
-use std::io::{Read, Write};
+use quick_xml::{NsReader, Reader, Writer};
+use std::io::Write;
 use std::path::Path;
 
-const TWIPS_PER_CM: f64 = 567.0;
-
+/// Walk state of the rewrite pass: flags, paragraph counter, and the (heading, Ctx) of each open paragraph.
 #[derive(Default)]
 struct State {
     in_ppr: bool,
     in_rpr: bool,
     in_t: bool,
-    heading: bool,
     prev_space: bool,
+    math_depth: usize,
     para: usize,
     ctx: Vec<Ctx>,
-    cur: Ctx,
+    cur: (bool, Ctx),
+    saved: Vec<(bool, Ctx)>,
+}
+
+impl State {
+    fn leave(&mut self, local: &str, ns: Ns) {
+        match (ns, local) {
+            (Ns::Math, "oMath" | "oMathPara") => {
+                self.math_depth = self.math_depth.saturating_sub(1)
+            }
+            (Ns::Word, "pPr") => self.in_ppr = false,
+            (Ns::Word, "rPr") => self.in_rpr = false,
+            (Ns::Word, "t") => self.in_t = false,
+            // WHY: a text box ends inside its outer paragraph, which gets its own heading and Ctx back.
+            (Ns::Word, "p") => {
+                self.cur = self.saved.pop().unwrap_or_default();
+                self.prev_space = false;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Fails when `output` is an existing file that is the same file as `input`, under any spelling.
+pub fn ensure_distinct(input: &Path, output: &Path) -> Result<()> {
+    // WHY: path text can differ (`./x`, case, `..`, hard link) while naming one file; compare file identity.
+    if output.exists() && same_file::is_same_file(input, output).unwrap_or(false) {
+        bail!("output must differ from the input file");
+    }
+    Ok(())
 }
 
 /// Copies `input` to `output`, fixing margins, fonts, sizes, line spacing and double spaces.
 pub fn fix_file(input: &Path, output: &Path, cfg: &ProfileConfig) -> Result<()> {
-    if input == output {
-        bail!("--fix output must differ from the input file");
-    }
+    ensure_distinct(input, output)?;
     let file =
         std::fs::File::open(input).with_context(|| format!("opening {}", input.display()))?;
     let mut zin = zip::ZipArchive::new(file).context("not a valid .docx (zip) archive")?;
+    // WHY: build beside the output and rename last, so a failed fix never destroys an earlier output.
+    let name = output
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let tmp = output.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let result = write_fixed(&mut zin, &tmp, cfg).and_then(|()| {
+        std::fs::rename(&tmp, output).with_context(|| format!("creating {}", output.display()))
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn write_fixed(
+    zin: &mut zip::ZipArchive<std::fs::File>,
+    tmp: &Path,
+    cfg: &ProfileConfig,
+) -> Result<()> {
     let mut zout = zip::ZipWriter::new(
-        std::fs::File::create(output).with_context(|| format!("creating {}", output.display()))?,
+        std::fs::File::create(tmp).with_context(|| format!("creating {}", tmp.display()))?,
     );
     let opts = zip::write::SimpleFileOptions::default();
     for i in 0..zin.len() {
@@ -41,44 +89,44 @@ pub fn fix_file(input: &Path, output: &Path, cfg: &ProfileConfig) -> Result<()> 
             zout.add_directory(name, opts)?;
             continue;
         }
-        let mut bytes = Vec::new();
-        entry.read_to_end(&mut bytes)?;
         if name == "word/document.xml" {
-            bytes = fix_xml(&String::from_utf8(bytes)?, cfg)?.into_bytes();
+            let xml = read_limited(&mut entry, MAX_DOCUMENT_XML_BYTES)?;
+            zout.start_file(name, opts)?;
+            zout.write_all(fix_xml(&xml, cfg)?.as_bytes())?;
+        } else {
+            zout.start_file(name, opts)?;
+            std::io::copy(&mut entry, &mut zout)?;
         }
-        zout.start_file(name, opts)?;
-        zout.write_all(&bytes)?;
     }
     zout.finish()?;
     Ok(())
 }
 
 pub fn fix_xml(xml: &str, cfg: &ProfileConfig) -> Result<String> {
-    let mut reader = Reader::from_str(xml);
+    let doc = parse_document(xml)?;
+    let mut reader = NsReader::from_str(xml);
     let mut w = Writer::new(Vec::new());
     let mut st = State {
-        ctx: para_context(xml, cfg)?,
+        ctx: contexts(&doc.paras, cfg),
         ..State::default()
     };
     loop {
-        let ev = reader.read_event().context("malformed document.xml")?;
+        let (res, ev) = reader
+            .read_resolved_event()
+            .context("malformed document.xml")?;
+        let ns = Ns::of(&res);
         match ev {
             Event::Eof => break,
             Event::Start(e) => {
-                let ne = fix_elem(&e, &mut st, cfg, true);
+                let ne = fix_elem(&e, ns, &mut st, cfg, true);
                 w.write_event(Event::Start(ne))?;
             }
             Event::Empty(e) => {
-                let ne = fix_elem(&e, &mut st, cfg, false);
+                let ne = fix_elem(&e, ns, &mut st, cfg, false);
                 w.write_event(Event::Empty(ne))?;
             }
             Event::End(e) => {
-                match e.local_name().as_ref() {
-                    "pPr" => st.in_ppr = false,
-                    "rPr" => st.in_rpr = false,
-                    "t" => st.in_t = false,
-                    _ => {}
-                }
+                st.leave(e.local_name().as_ref(), ns);
                 w.write_event(Event::End(e))?;
             }
             Event::Text(t) if st.in_t => {
@@ -100,12 +148,6 @@ pub fn fix_xml(xml: &str, cfg: &ProfileConfig) -> Result<String> {
         }
     }
     split_foreign_runs(&String::from_utf8(w.into_inner())?, cfg)
-}
-
-fn escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 /// Inserts `<w:i/>` into a run's `<w:rPr>` (creating one if absent) in schema order.
@@ -160,24 +202,34 @@ fn split_foreign_runs(xml: &str, cfg: &ProfileConfig) -> Result<String> {
     if terms.iter().all(|t| t.is_empty()) {
         return Ok(xml.to_string());
     }
-    let mut reader = Reader::from_str(xml);
+    let mut reader = NsReader::from_str(xml);
     let mut out = String::with_capacity(xml.len());
     let mut copied = 0usize;
+    // Open `w:r` elements: (start of the tag, end of the start tag, qualified name).
+    let mut open: Vec<(usize, usize, String)> = Vec::new();
     loop {
         let before = reader.buffer_position() as usize;
-        let ev = reader.read_event().context("malformed document.xml")?;
+        let (res, ev) = reader
+            .read_resolved_event()
+            .context("malformed document.xml")?;
+        let word = Ns::of(&res) == Ns::Word;
         match ev {
             Event::Eof => break,
-            Event::Start(e) if e.local_name().as_ref() == "r" => {
-                let start_tag_end = reader.buffer_position() as usize;
+            Event::Start(e) if word && e.local_name().as_ref() == "r" => {
                 let name = e.name().as_ref().to_string();
-                let pfx = name.strip_suffix('r').unwrap_or("w:").to_string();
-                // WHY: read_to_end skips the whole run so we can slice its raw XML by byte offsets.
-                reader.read_to_end(e.name())?;
+                open.push((before, reader.buffer_position() as usize, name));
+            }
+            Event::End(e) if word && e.local_name().as_ref() == "r" => {
+                let Some((start, tag_end, name)) = open.pop() else {
+                    continue;
+                };
                 let run_end = reader.buffer_position() as usize;
-                let inner = &xml[start_tag_end..run_end - format!("</{name}>").len()];
-                if let Some(new) = split_run(&xml[before..start_tag_end], inner, &pfx, terms)? {
-                    out.push_str(&xml[copied..before]);
+                let pfx = name.strip_suffix('r').unwrap_or("w:");
+                // WHY: a run holding a text box is not rewritten; its inner runs end first and were already handled.
+                if let Some(new) =
+                    split_run(&xml[start..tag_end], &xml[tag_end..before], pfx, terms)?
+                {
+                    out.push_str(&xml[copied..start]);
                     out.push_str(&new);
                     copied = run_end;
                 }
@@ -193,6 +245,69 @@ fn split_foreign_runs(xml: &str, cfg: &ProfileConfig) -> Result<String> {
 enum Piece {
     Text(String),
     Raw(String),
+}
+
+/// Text a marker element adds to the run text the linter sees (see `parse_document`).
+fn marker_text(raw: &str) -> &'static str {
+    let name = raw[1..]
+        .split(|c: char| c.is_whitespace() || c == '/' || c == '>')
+        .next()
+        .unwrap_or("");
+    match name.rsplit(':').next().unwrap_or("") {
+        "tab" => "\t",
+        "br" | "cr" => "\n",
+        _ => "",
+    }
+}
+
+/// A piece of a run, tagged with the term span (index) that covers it, if any.
+type Cut = (Option<usize>, Piece);
+
+/// Cuts every piece at the term spans; markers inside a span stay with that span.
+fn cut_pieces(pieces: Vec<Piece>, joined: &str, spans: &[(usize, usize)]) -> Vec<Cut> {
+    let mut cuts: Vec<Cut> = Vec::new();
+    let mut at = 0usize;
+    for piece in pieces {
+        match piece {
+            Piece::Raw(raw) => {
+                let end = at + marker_text(&raw).len();
+                let inside = spans.iter().position(|&(a, b)| {
+                    if end == at {
+                        a < at && at < b
+                    } else {
+                        a <= at && end <= b
+                    }
+                });
+                cuts.push((inside, Piece::Raw(raw)));
+                at = end;
+            }
+            Piece::Text(text) => {
+                let end = at + text.len();
+                if text.is_empty() {
+                    let inside = spans.iter().position(|&(a, b)| a < at && at < b);
+                    cuts.push((inside, Piece::Text(text)));
+                    continue;
+                }
+                let mut pos = at;
+                for (i, &(a, b)) in spans.iter().enumerate() {
+                    if b <= pos || a >= end {
+                        continue;
+                    }
+                    let (lo, hi) = (a.max(pos), b.min(end));
+                    if lo > pos {
+                        cuts.push((None, Piece::Text(joined[pos..lo].to_string())));
+                    }
+                    cuts.push((Some(i), Piece::Text(joined[lo..hi].to_string())));
+                    pos = hi;
+                }
+                if pos < end {
+                    cuts.push((None, Piece::Text(joined[pos..end].to_string())));
+                }
+                at = end;
+            }
+        }
+    }
+    cuts
 }
 
 /// Replacement XML for one run, or None when the run is untouched.
@@ -246,21 +361,11 @@ fn split_run(open: &str, inner: &str, pfx: &str, terms: &[String]) -> Result<Opt
             }
             Event::GeneralRef(g) if in_t => {
                 if let Some(Piece::Text(text)) = pieces.last_mut() {
-                    text.push(match g.into_inner().as_ref() {
-                        "amp" => '&',
-                        "lt" => '<',
-                        "gt" => '>',
-                        "quot" => '"',
-                        "apos" => '\'',
-                        _ => return Ok(None),
-                    })
+                    text.push(resolve_ref(&g)?);
                 }
             }
             _ => {}
         }
-    }
-    if open.ends_with("/>") {
-        return Ok(None);
     }
     // Already italic runs keep their formatting.
     let italic_key = format!("<{pfx}i");
@@ -274,77 +379,101 @@ fn split_run(open: &str, inner: &str, pfx: &str, terms: &[String]) -> Result<Opt
     if already {
         return Ok(None);
     }
-    let it = italic_rpr(&rpr, pfx);
-    let mk = |rp: &str, s: &str| {
-        format!(
-            "{open}{rp}<{pfx}t xml:space=\"preserve\">{}</{pfx}t></{pfx}r>",
-            escape(s)
-        )
-    };
-    let (mut out, mut changed) = (String::new(), false);
-    for piece in &pieces {
-        let text = match piece {
-            Piece::Raw(raw) => {
-                out.push_str(&format!("{open}{rpr}{raw}</{pfx}r>"));
-                continue;
-            }
-            Piece::Text(t) => t,
-        };
-        let mut hits: Vec<(usize, usize)> =
-            terms.iter().flat_map(|t| find_words(text, t)).collect();
-        hits.sort();
-        // WHY: overlapping terms (e.g. "data" and "database") would double-split; merge them.
-        let mut spans: Vec<(usize, usize)> = Vec::new();
-        for h in hits {
-            match spans.last_mut() {
-                Some(last) if h.0 < last.1 => last.1 = last.1.max(h.1),
-                _ => spans.push(h),
-            }
-        }
-        changed |= !spans.is_empty();
-        let mut pos = 0;
-        for (a, b) in spans {
-            if a > pos {
-                out.push_str(&mk(&rpr, &text[pos..a]));
-            }
-            out.push_str(&mk(&it, &text[a..b]));
-            pos = b;
-        }
-        if pos < text.len() || text.is_empty() {
-            out.push_str(&mk(&rpr, &text[pos..]));
+    // WHY: match on the joined text, exactly as the linter reads the run, so terms across `w:t` are found.
+    let joined: String = pieces
+        .iter()
+        .map(|p| match p {
+            Piece::Text(t) => t.as_str(),
+            Piece::Raw(r) => marker_text(r),
+        })
+        .collect();
+    let mut hits: Vec<(usize, usize)> = terms.iter().flat_map(|t| find_words(&joined, t)).collect();
+    hits.sort();
+    // WHY: overlapping terms (e.g. "data" and "database") would double-split; merge them.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for h in hits {
+        match spans.last_mut() {
+            Some(last) if h.0 < last.1 => last.1 = last.1.max(h.1),
+            _ => spans.push(h),
         }
     }
-    Ok(changed.then_some(out))
+    if spans.is_empty() {
+        return Ok(None);
+    }
+    let it = italic_rpr(&rpr, pfx);
+    let text_el = |s: &str| format!("<{pfx}t xml:space=\"preserve\">{}</{pfx}t>", escape_text(s));
+    let cuts = cut_pieces(pieces, &joined, &spans);
+    let mut out = String::new();
+    let mut i = 0;
+    while i < cuts.len() {
+        match cuts[i].0 {
+            // Outside any term: one run per piece, with the original formatting.
+            None => {
+                let body = match &cuts[i].1 {
+                    Piece::Text(t) => text_el(t),
+                    Piece::Raw(r) => r.clone(),
+                };
+                out.push_str(&format!("{open}{rpr}{body}</{pfx}r>"));
+                i += 1;
+            }
+            // Inside a term: every piece the term covers shares one italic run.
+            Some(span) => {
+                out.push_str(&format!("{open}{it}"));
+                while i < cuts.len() && cuts[i].0 == Some(span) {
+                    match &cuts[i].1 {
+                        Piece::Text(t) => out.push_str(&text_el(t)),
+                        Piece::Raw(r) => out.push_str(r),
+                    }
+                    i += 1;
+                }
+                out.push_str(&format!("</{pfx}r>"));
+            }
+        }
+    }
+    Ok(Some(out))
 }
 
 /// Updates parser state like the linter does and returns the element with corrected attributes.
 fn fix_elem(
     e: &BytesStart,
+    ns: Ns,
     st: &mut State,
     cfg: &ProfileConfig,
     is_start: bool,
 ) -> BytesStart<'static> {
     let name = e.local_name();
     let local = name.as_ref().to_string();
+    match ns {
+        Ns::Math => {
+            if is_start && matches!(local.as_str(), "oMath" | "oMathPara") {
+                st.math_depth += 1;
+            }
+            return e.clone().into_owned();
+        }
+        Ns::Other => return e.clone().into_owned(),
+        Ns::Word => {}
+    }
     match local.as_str() {
         "p" => {
-            st.heading = false;
-            st.prev_space = false;
             st.para += 1;
-            st.cur = st.ctx.get(st.para - 1).copied().unwrap_or_default();
+            st.prev_space = false;
+            let ctx = st.ctx.get(st.para - 1).copied().unwrap_or_default();
+            if is_start {
+                st.saved.push(st.cur);
+                st.cur = (false, ctx);
+            }
         }
         "pPr" if is_start => st.in_ppr = true,
         "rPr" if is_start => st.in_rpr = true,
         "t" if is_start => st.in_t = true,
-        "pStyle" => {
-            let s = attr(e, "val").unwrap_or_default().to_lowercase();
-            st.heading = s.starts_with("heading") || s == "title";
-        }
+        "pStyle" => st.cur.0 = is_heading_style(&attr(e, "val").unwrap_or_default()),
+        "tab" | "br" | "cr" => st.prev_space = false,
         _ => {}
     }
+    let heading = st.cur.0;
     let applies = match local.as_str() {
         "pgMar" => true,
-        "rFonts" | "sz" => st.in_rpr && (local == "rFonts" || !st.heading),
+        "rFonts" | "sz" => st.in_rpr && st.math_depth == 0 && (local == "rFonts" || !heading),
         "spacing" => st.in_ppr && attr(e, "lineRule").is_none_or(|r| r == "auto"),
         _ => false,
     };
@@ -357,7 +486,7 @@ fn fix_elem(
             .map(|c| c.into_owned())
             .unwrap_or_default();
         let val = if applies {
-            fixed_value(&local, a.key.local_name().as_ref(), &val, cfg, st.cur).unwrap_or(val)
+            fixed_value(&local, a.key.local_name().as_ref(), &val, cfg, st.cur.1).unwrap_or(val)
         } else {
             val
         };
@@ -378,8 +507,8 @@ fn fixed_value(elem: &str, key: &str, val: &str, cfg: &ProfileConfig, ctx: Ctx) 
                 "right" => cfg.page.right_cm,
                 _ => return None,
             };
-            // WHY: 1 cm = 567 twips; only touch values the linter would flag.
-            ((num? / TWIPS_PER_CM - expected).abs() > cfg.page.tolerance_cm)
+            // WHY: only touch values the linter would flag.
+            margin_off(num?, expected, cfg.page.tolerance_cm)
                 .then(|| format!("{}", (expected * TWIPS_PER_CM).round() as i64))
         }
         ("rFonts", "ascii" | "hAnsi") => {

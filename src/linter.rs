@@ -1,12 +1,10 @@
 use crate::config::ProfileConfig;
+use crate::structure::{Document, Layout, contexts, margin_off, parse_document};
 use anyhow::{Context, Result};
-use quick_xml::Reader;
-use quick_xml::events::{BytesStart, Event};
+use quick_xml::events::BytesStart;
 use serde::Serialize;
 use std::io::Read;
 use std::path::Path;
-
-const TWIPS_PER_CM: f64 = 567.0;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Violation {
@@ -24,15 +22,31 @@ pub(crate) fn v(code: &str, message: String, paragraph: usize) -> Violation {
     }
 }
 
+/// Largest `word/document.xml` (decompressed) that lint and fix will read.
+pub const MAX_DOCUMENT_XML_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Reads UTF-8 text from `r`, failing once it passes `limit` bytes.
+pub(crate) fn read_limited(r: &mut impl Read, limit: u64) -> Result<String> {
+    let mut bytes = Vec::new();
+    r.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        anyhow::bail!("word/document.xml exceeds the {limit} byte limit");
+    }
+    Ok(String::from_utf8(bytes)?)
+}
+
 pub fn read_document_xml(path: &Path) -> Result<String> {
+    read_document_xml_limited(path, MAX_DOCUMENT_XML_BYTES)
+}
+
+/// Like `read_document_xml`, with an explicit size limit in bytes.
+pub fn read_document_xml_limited(path: &Path, limit: u64) -> Result<String> {
     let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut zip = zip::ZipArchive::new(file).context("not a valid .docx (zip) archive")?;
     let mut entry = zip
         .by_name("word/document.xml")
         .context("missing word/document.xml")?;
-    let mut xml = String::new();
-    entry.read_to_string(&mut xml)?;
-    Ok(xml)
+    read_limited(&mut entry, limit)
 }
 
 pub fn lint_file(path: &Path, cfg: &ProfileConfig) -> Result<Vec<Violation>> {
@@ -50,115 +64,77 @@ pub(crate) fn attr(e: &BytesStart, name: &str) -> Option<String> {
         })
 }
 
-fn attr_f64(e: &BytesStart, name: &str) -> Option<f64> {
-    attr(e, name)?.parse().ok()
+/// Lints `word/document.xml`: parses it once, then checks the parsed model.
+pub fn lint_xml(xml: &str, cfg: &ProfileConfig) -> Result<Vec<Violation>> {
+    Ok(lint_document(&parse_document(xml)?, cfg))
 }
 
-/// Streams `word/document.xml` once and checks margins, fonts and line spacing.
-pub fn lint_xml(xml: &str, cfg: &ProfileConfig) -> Result<Vec<Violation>> {
+/// Layout findings in document order, then the structure checks.
+pub fn lint_document(doc: &Document, cfg: &ProfileConfig) -> Vec<Violation> {
     let mut out = Vec::new();
-    // WHY: quick-xml is pull-based; we keep our own flags to know which parent element we are in.
-    let mut reader = Reader::from_str(xml);
-    let mut para = 0usize;
-    let (mut in_ppr, mut in_rpr) = (false, false);
-    let mut heading = false;
-    let tol = cfg.page.tolerance_cm;
-    // WHY: front-matter/table membership needs whole-document knowledge, so compute it up front.
-    let ctx = crate::structure::para_context(xml, cfg)?;
-    let mut cur = crate::structure::Ctx::default();
-
-    loop {
-        let ev = reader.read_event().context("malformed document.xml")?;
-        let (e, is_start) = match &ev {
-            Event::Eof => break,
-            Event::Start(e) => (e, true),
-            Event::Empty(e) => (e, false),
-            Event::End(e) => {
-                match e.local_name().as_ref() {
-                    "pPr" => in_ppr = false,
-                    "rPr" => in_rpr = false,
-                    _ => {}
-                }
-                continue;
-            }
-            _ => continue,
-        };
-        match e.local_name().as_ref() {
-            "p" => {
-                para += 1;
-                heading = false;
-                cur = ctx.get(para - 1).copied().unwrap_or_default();
-            }
-            "pPr" if is_start => in_ppr = true,
-            "rPr" if is_start => in_rpr = true,
-            "pStyle" => {
-                let s = attr(e, "val").unwrap_or_default().to_lowercase();
-                heading = s.starts_with("heading") || s == "title";
-            }
-            "pgMar" => {
-                for (side, expected) in [
-                    ("top", cfg.page.top_cm),
-                    ("left", cfg.page.left_cm),
-                    ("bottom", cfg.page.bottom_cm),
-                    ("right", cfg.page.right_cm),
-                ] {
-                    if let Some(tw) = attr_f64(e, side) {
-                        let cm = tw / TWIPS_PER_CM;
-                        if (cm - expected).abs() > tol {
-                            out.push(v(
-                                "MARGIN_ERROR",
-                                format!("{side} margin is {cm:.2} cm, expected {expected:.2} cm"),
-                                0,
-                            ));
-                        }
-                    }
+    let ctx = contexts(&doc.paras, cfg);
+    for fact in &doc.facts {
+        let para = fact.para;
+        let index = para.checked_sub(1);
+        let cur = index.and_then(|i| ctx.get(i)).copied().unwrap_or_default();
+        match &fact.layout {
+            Layout::Margin { side, twips } => {
+                let expected = match *side {
+                    "top" => cfg.page.top_cm,
+                    "left" => cfg.page.left_cm,
+                    "bottom" => cfg.page.bottom_cm,
+                    _ => cfg.page.right_cm,
+                };
+                if margin_off(*twips, expected, cfg.page.tolerance_cm) {
+                    let cm = twips / crate::structure::TWIPS_PER_CM;
+                    out.push(v(
+                        "MARGIN_ERROR",
+                        format!("{side} margin is {cm:.2} cm, expected {expected:.2} cm"),
+                        0,
+                    ));
                 }
             }
-            "rFonts" if in_rpr => {
-                for key in ["ascii", "hAnsi"] {
-                    if let Some(f) = attr(e, key)
-                        && f != cfg.typography.font_name
-                    {
-                        out.push(v(
-                            "FONT_ERROR",
-                            format!("font '{f}', expected '{}'", cfg.typography.font_name),
-                            para,
-                        ));
-                        break;
-                    }
+            Layout::Fonts { ascii, h_ansi } => {
+                if let Some(f) = [ascii, h_ansi]
+                    .into_iter()
+                    .flatten()
+                    .find(|f| **f != cfg.typography.font_name)
+                {
+                    out.push(v(
+                        "FONT_ERROR",
+                        format!("font '{f}', expected '{}'", cfg.typography.font_name),
+                        para,
+                    ));
                 }
             }
-            "sz" if in_rpr && !heading => {
-                if let Some(half) = attr_f64(e, "val") {
-                    let pt = half / 2.0;
-                    if !cur.size_ok(pt, cfg) {
-                        out.push(v(
-                            "FONT_ERROR",
-                            format!("size {pt} pt, expected {} pt", cfg.typography.body_size_pt),
-                            para,
-                        ));
-                    }
+            Layout::Size { half_pt } => {
+                let heading = index
+                    .and_then(|i| doc.paras.get(i))
+                    .is_some_and(|p| p.heading);
+                let pt = half_pt / 2.0;
+                if !heading && !cur.size_ok(pt, cfg) {
+                    out.push(v(
+                        "FONT_ERROR",
+                        format!("size {pt} pt, expected {} pt", cfg.typography.body_size_pt),
+                        para,
+                    ));
                 }
             }
-            "spacing" if in_ppr => {
-                let auto = attr(e, "lineRule").is_none_or(|r| r == "auto");
-                if let (Some(line), true) = (attr_f64(e, "line"), auto) {
-                    let ratio = line / 240.0;
-                    if !cur.spacing_ok(ratio, cfg) {
-                        out.push(v(
-                            "SPACING_ERROR",
-                            format!(
-                                "line spacing {ratio:.2}, expected {}",
-                                cfg.typography.line_spacing
-                            ),
-                            para,
-                        ));
-                    }
+            Layout::Spacing { line } => {
+                let ratio = line / 240.0;
+                if !cur.spacing_ok(ratio, cfg) {
+                    out.push(v(
+                        "SPACING_ERROR",
+                        format!(
+                            "line spacing {ratio:.2}, expected {}",
+                            cfg.typography.line_spacing
+                        ),
+                        para,
+                    ));
                 }
             }
-            _ => {}
         }
     }
-    crate::structure::check(xml, cfg, &mut out)?;
-    Ok(out)
+    crate::structure::check(&doc.paras, cfg, &mut out);
+    out
 }

@@ -315,3 +315,256 @@ fn auto_numbered_heading1_counts_as_chapter_for_captions() {
     ];
     assert!(codes(d, &ok).is_empty());
 }
+
+const GOOD_RPR: &str = "<w:rPr><w:rFonts w:ascii=\"Times New Roman\" w:hAnsi=\"Times New Roman\"/><w:sz w:val=\"24\"/></w:rPr>";
+
+fn plain_run(text: &str) -> String {
+    format!("<w:r>{GOOD_RPR}<w:t xml:space=\"preserve\">{text}</w:t></w:r>")
+}
+
+/// Paragraph whose middle run holds a VML text box with `inner` paragraphs inside it.
+fn textbox_para(before: &str, inner: &str, after: &str) -> String {
+    format!(
+        "<w:p><w:pPr><w:spacing w:line=\"360\" w:lineRule=\"auto\"/></w:pPr>{}\
+<w:r><w:pict><v:shape id=\"s\"><v:textbox><w:txbxContent>{inner}</w:txbxContent></v:textbox></v:shape></w:pict></w:r>{}</w:p>",
+        plain_run(before),
+        plain_run(after)
+    )
+}
+
+fn pairs(dir: &Path, parts: &[String]) -> Vec<(String, u64)> {
+    viol_pairs(&lint_body(dir, &body(parts), &[]).1, "violations")
+}
+
+const BAD_PARA_ARIAL_DOUBLE: &str = "<w:p><w:pPr><w:spacing w:line=\"360\" w:lineRule=\"auto\"/></w:pPr><w:r><w:rPr><w:rFonts w:ascii=\"Arial\" w:hAnsi=\"Arial\"/><w:sz w:val=\"24\"/></w:rPr><w:t xml:space=\"preserve\">dua  spasi</w:t></w:r></w:p>";
+
+#[test]
+fn text_box_paragraphs_keep_index_and_outer_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    // Paragraphs by start tag: 1 first, 2 outer, 3 inside the box, 4 bad.
+    let parts = [
+        good_para("awal"),
+        textbox_para("sebelum ", &good_para("kotak"), "sesudah"),
+        BAD_PARA_ARIAL_DOUBLE.to_string(),
+    ];
+    assert_eq!(
+        pairs(d, &parts),
+        vec![
+            ("FONT_ERROR".to_string(), 4),
+            ("DOUBLE_SPACE_ERROR".to_string(), 4)
+        ]
+    );
+    // The outer paragraph keeps its own text around the box.
+    let parts = [textbox_para("TODO ", &good_para("kotak"), "sesudah")];
+    assert_eq!(pairs(d, &parts), vec![("DRAFT_TOKEN_ERROR".to_string(), 1)]);
+}
+
+#[test]
+fn text_box_does_not_shift_exemptions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    let parts = [
+        textbox_para("sebelum ", &good_para("kotak"), "sesudah"),
+        sized_para("JUDUL SKRIPSI", 32, 360),
+        heading_para("BAB I", "center"),
+        table(&sized_para("sel", 20, 240)),
+        good_para("Isi."),
+    ];
+    assert!(pairs(d, &parts).is_empty());
+    let (json, xml) = fix_body(d, &body(&parts));
+    assert!(viol_pairs(&json, "remaining").is_empty());
+    assert!(xml.contains("w:val=\"32\""), "{xml}");
+    assert!(xml.contains("w:val=\"20\""), "{xml}");
+    assert!(xml.contains("w:line=\"240\""), "{xml}");
+}
+
+#[test]
+fn drawingml_and_math_are_not_wml_paragraphs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    let drawing = "<w:p><w:r><w:drawing><a:p><a:r><a:rPr/><a:t>database</a:t></a:r></a:p></w:drawing></w:r></w:p>";
+    let math = "<w:p><m:oMath><m:r><m:rPr><m:sty m:val=\"p\"/></m:rPr><m:t>database</m:t></m:r></m:oMath></w:p>";
+    let parts = [
+        drawing.to_string(),
+        math.to_string(),
+        BAD_PARA_ARIAL_DOUBLE.replace("dua  spasi", "dua spasi"),
+    ];
+    assert_eq!(pairs(d, &parts), vec![("FONT_ERROR".to_string(), 3)]);
+    let (json, xml) = fix_body(d, &body(&parts));
+    assert!(viol_pairs(&json, "remaining").is_empty());
+    assert!(!xml.contains("<m:i/>") && !xml.contains("<a:i/>"), "{xml}");
+    assert!(xml.contains("<m:rPr><m:sty m:val=\"p\"/></m:rPr>"), "{xml}");
+    assert!(xml.contains("<a:t>database</a:t>"), "{xml}");
+}
+
+#[test]
+fn equation_fonts_are_neither_flagged_nor_rewritten() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    let cambria = "<w:rPr><w:rFonts w:ascii=\"Cambria Math\" w:hAnsi=\"Cambria Math\"/><w:sz w:val=\"28\"/></w:rPr>";
+    let inline = format!("<w:p><m:oMath><m:r>{cambria}<m:t>x</m:t></m:r></m:oMath></w:p>");
+    let display = format!(
+        "<w:p><m:oMathPara><m:oMath><m:r>{cambria}<m:t>y</m:t></m:r></m:oMath></m:oMathPara></w:p>"
+    );
+    let parts = [inline, display, good_para("teks")];
+    assert!(pairs(d, &parts).is_empty());
+    let (_, xml) = fix_body(d, &body(&parts));
+    assert_eq!(xml.matches("Cambria Math").count(), 4, "{xml}");
+    assert_eq!(xml.matches("w:val=\"28\"").count(), 2, "{xml}");
+}
+
+/// The run that holds `<w:i/>` and every needle, if exactly one such run exists.
+fn italic_run_with<'a>(xml: &'a str, needles: &[&str]) -> Option<&'a str> {
+    let runs: Vec<&str> = xml
+        .split("<w:r>")
+        .filter(|r| r.contains("<w:i/>") && needles.iter().all(|n| r.contains(n)))
+        .collect();
+    (runs.len() == 1).then(|| runs[0])
+}
+
+#[test]
+fn fixer_italicizes_term_split_across_w_t_elements() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    let split = format!(
+        "<w:p><w:r>{GOOD_RPR}<w:t xml:space=\"preserve\">Pakai data</w:t><w:t>base lokal</w:t></w:r></w:p>"
+    );
+    let (json, xml) = fix_body(d, &body(&[split]));
+    assert!(viol_pairs(&json, "remaining").is_empty());
+    assert!(
+        italic_run_with(&xml, &[">data<", ">base<"]).is_some(),
+        "{xml}"
+    );
+
+    let marker = "<w:p><w:r><w:rPr><w:b/></w:rPr><w:t xml:space=\"preserve\">Pakai data</w:t>\
+<w:lastRenderedPageBreak/><w:t xml:space=\"preserve\">base </w:t><w:t>dan cache</w:t></w:r></w:p>";
+    let (json, xml) = fix_body(d, &body(&[marker.to_string()]));
+    assert!(viol_pairs(&json, "remaining").is_empty());
+    let run = italic_run_with(&xml, &[">data<", "<w:lastRenderedPageBreak/>", ">base<"]);
+    assert!(run.is_some(), "{xml}");
+}
+
+#[test]
+fn fixer_italicizes_terms_inside_text_boxes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    let inner = "<w:p><w:r><w:t>pakai database</w:t></w:r></w:p>";
+    let pict_open = "<w:r><w:pict><v:shape id=\"s\"><v:textbox>";
+    let pict = format!(
+        "<w:p>{pict_open}<w:txbxContent>{inner}</w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>"
+    );
+    let alt_open = "<w:r><mc:AlternateContent><mc:Choice Requires=\"wps\">";
+    let alt = format!(
+        "<w:p>{alt_open}<w:drawing><wps:wsp><wps:txbx><w:txbxContent>{inner}</w:txbxContent></wps:txbx></wps:wsp></w:drawing></mc:Choice>\
+<mc:Fallback><w:pict><v:shape id=\"t\"><v:textbox><w:txbxContent>{inner}</w:txbxContent></v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:r></w:p>"
+    );
+    for (frag, outer) in [(pict, pict_open), (alt, alt_open)] {
+        let (json, xml) = fix_body(d, &body(&[frag]));
+        let rem = json["remaining"].to_string();
+        assert!(!rem.contains("FOREIGN_TERM_NOT_ITALIC"), "{rem}");
+        // The outer run is left as it was.
+        assert!(xml.contains(outer), "{xml}");
+    }
+}
+
+fn profiles_dir_term_docx(d: &Path, text: &str) -> Vec<String> {
+    let b = body(&[good_para(text)]);
+    viol_codes(&lint_body(d, &b, &[]).1)
+}
+
+#[test]
+fn dictionary_with_bom_or_utf16_is_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    std::fs::create_dir_all(d.join("profiles")).unwrap();
+    let dict = d.join("profiles/foreign_terms.txt");
+    let utf16: Vec<u8> = [0xFF, 0xFE]
+        .into_iter()
+        .chain(
+            "# komentar\nDocker\n"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        )
+        .collect();
+    let utf8_bom: Vec<u8> = [0xEF, 0xBB, 0xBF]
+        .into_iter()
+        .chain("# komentar\nDocker\n".bytes())
+        .collect();
+    for (label, bytes) in [
+        ("utf8", b"# komentar\nDocker\n".to_vec()),
+        ("utf8-bom", utf8_bom),
+        ("utf16-bom", utf16),
+    ] {
+        std::fs::write(&dict, bytes).unwrap();
+        let store = ProfileStore::new(d.join("profiles"));
+        assert_eq!(store.load_dictionary(), vec!["Docker"], "{label}");
+        assert_eq!(
+            profiles_dir_term_docx(d, "Kami memakai docker"),
+            vec!["FOREIGN_TERM_NOT_ITALIC"],
+            "{label}"
+        );
+        assert!(profiles_dir_term_docx(d, "Kami memakai komentar").is_empty());
+    }
+}
+
+#[test]
+fn save_keeps_profile_term_also_in_dictionary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_docx-lint"))
+            .current_dir(d)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert!(run(&["config", "init", "p"]).status.success());
+    std::fs::write(d.join("profiles/foreign_terms.txt"), "framework\ndocker\n").unwrap();
+    assert!(
+        run(&["config", "set", "p", "page.top_cm", "3.9"])
+            .status
+            .success()
+    );
+    let toml = std::fs::read_to_string(d.join("profiles/p.toml")).unwrap();
+    assert!(toml.contains("\"framework\""), "{toml}");
+    assert!(!toml.contains("docker"), "{toml}");
+    std::fs::remove_file(d.join("profiles/foreign_terms.txt")).unwrap();
+    let shown = run(&["config", "show", "p"]);
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("\"framework\""));
+}
+
+#[test]
+fn unnumbered_heading1_is_not_a_chapter_when_chapters_are_typed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    let parts = [
+        heading_para("KATA PENGANTAR", "center"),
+        sized_para("Isi kata pengantar.", 28, 360),
+        good_para("DAFTAR GAMBAR"),
+        good_para("Gambar 3.9 Daftar"),
+        heading_para("BAB I", "center"),
+        good_para("Gambar 1.1 Satu"),
+    ];
+    assert!(codes(d, &parts).is_empty());
+}
+
+#[test]
+fn italic_off_values_count_as_not_italic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    let off = |val: &str| {
+        format!(
+            "<w:p><w:r><w:rPr><w:i w:val=\"{val}\"/></w:rPr><w:t>pakai framework</w:t></w:r></w:p>"
+        )
+    };
+    let parts = [off("0"), off("false")];
+    assert_eq!(
+        codes(d, &parts),
+        vec!["FOREIGN_TERM_NOT_ITALIC", "FOREIGN_TERM_NOT_ITALIC"]
+    );
+    let (json, xml) = fix_body(d, &body(&parts));
+    assert!(json["remaining"].as_array().unwrap().is_empty());
+    let italic_term = "<w:rPr><w:i/></w:rPr><w:t xml:space=\"preserve\">framework</w:t>";
+    assert_eq!(xml.matches(italic_term).count(), 2, "{xml}");
+}

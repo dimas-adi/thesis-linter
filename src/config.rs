@@ -45,6 +45,63 @@ pub struct ProfileConfig {
 }
 
 impl ProfileConfig {
+    /// Rejects values outside the Profile Schema, so unusable numbers never reach the fixer.
+    pub fn validate(&self) -> Result<()> {
+        let finite_at_least = |name: &str, v: f64, min: f64| {
+            if v.is_finite() && v >= min {
+                Ok(())
+            } else {
+                bail!("invalid value for '{name}': {v}")
+            }
+        };
+        let p = &self.page;
+        for (name, v) in [
+            ("page.top_cm", p.top_cm),
+            ("page.left_cm", p.left_cm),
+            ("page.bottom_cm", p.bottom_cm),
+            ("page.right_cm", p.right_cm),
+            ("page.tolerance_cm", p.tolerance_cm),
+        ] {
+            finite_at_least(name, v, 0.0)?;
+        }
+        let t = &self.typography;
+        for (name, v) in [
+            ("typography.body_size_pt", t.body_size_pt),
+            ("typography.line_spacing", t.line_spacing),
+        ] {
+            finite_at_least(name, v, 0.0)?;
+            if v == 0.0 {
+                bail!("invalid value for '{name}': {v}");
+            }
+        }
+        let s = &self.structure;
+        for (name, v, allowed) in [
+            (
+                "structure.chapter_numbering",
+                &s.chapter_numbering,
+                &["roman", "arabic"][..],
+            ),
+            (
+                "structure.heading_alignment",
+                &s.heading_alignment,
+                &["center", "left"][..],
+            ),
+            (
+                "structure.caption_separator",
+                &s.caption_separator,
+                &[".", "-"][..],
+            ),
+        ] {
+            if !allowed.contains(&v.as_str()) {
+                bail!(
+                    "invalid value for '{name}': '{v}' (allowed: {})",
+                    allowed.join(", ")
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn default_named(name: &str) -> Self {
         ProfileConfig {
             profile_name: name.to_string(),
@@ -99,8 +156,9 @@ impl ProfileStore {
     }
 
     fn path(&self, name: &str) -> Result<PathBuf> {
-        // WHY: reject separators so a profile name can never escape the profiles directory.
-        if name.is_empty() || name.contains(['/', '\\', '.']) {
+        // WHY: separators, drive colons, and stream or reserved characters could leave the profiles directory.
+        let bad = |c: char| c.is_control() || "/\\.:<>\"|?*".contains(c);
+        if name.is_empty() || name.contains(bad) {
             bail!("invalid profile name '{name}'");
         }
         Ok(self.dir.join(format!("{name}.toml")))
@@ -111,15 +169,26 @@ impl ProfileStore {
     }
 
     pub fn save(&self, cfg: &ProfileConfig) -> Result<()> {
-        let path = self.path(&cfg.profile_name)?;
+        self.write(&self.path(&cfg.profile_name)?, cfg)
+    }
+
+    fn write(&self, path: &Path, cfg: &ProfileConfig) -> Result<()> {
+        cfg.validate()?;
         std::fs::create_dir_all(&self.dir)?;
         // WHY: dictionary words were merged in on load; writing them back would duplicate the file's content.
         let dict = self.load_dictionary();
+        // WHY: a term already in the file is the profile's own, even when the dictionary lists it too.
+        let on_disk: Vec<String> = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| toml::from_str::<ProfileConfig>(&t).ok())
+            .map(|c| c.academic.foreign_terms_must_italicize)
+            .unwrap_or_default();
         let mut own = cfg.clone();
-        own.academic
-            .foreign_terms_must_italicize
-            .retain(|t| !dict.iter().any(|d| d.eq_ignore_ascii_case(t)));
-        std::fs::write(&path, toml::to_string_pretty(&own)?)
+        own.academic.foreign_terms_must_italicize.retain(|t| {
+            on_disk.iter().any(|d| d.eq_ignore_ascii_case(t))
+                || !dict.iter().any(|d| d.eq_ignore_ascii_case(t))
+        });
+        std::fs::write(path, toml::to_string_pretty(&own)?)
             .with_context(|| format!("writing {}", path.display()))
     }
 
@@ -127,7 +196,9 @@ impl ProfileStore {
         let path = self.path(name)?;
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("profile '{name}' not found at {}", path.display()))?;
-        Ok(self.with_dictionary(toml::from_str(&text)?))
+        let cfg: ProfileConfig = toml::from_str(&text)?;
+        cfg.validate()?;
+        Ok(self.with_dictionary(cfg))
     }
 
     fn with_dictionary(&self, mut cfg: ProfileConfig) -> ProfileConfig {
@@ -146,7 +217,8 @@ impl ProfileStore {
 
     /// Words from `foreign_terms.txt` (one per line; blank lines and `#` comments ignored).
     pub fn load_dictionary(&self) -> Vec<String> {
-        let text = std::fs::read_to_string(self.dictionary_path()).unwrap_or_default();
+        let text = std::fs::read(self.dictionary_path())
+            .map_or_else(|_| String::new(), |b| decode_text(&b));
         text.lines()
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
@@ -160,6 +232,9 @@ impl ProfileStore {
     }
 
     pub fn init(&self, name: &str) -> Result<ProfileConfig> {
+        if self.path(name)?.exists() {
+            bail!("profile '{name}' already exists");
+        }
         let cfg = ProfileConfig::default_named(name);
         self.save(&cfg)?;
         Ok(cfg)
@@ -187,6 +262,9 @@ impl ProfileStore {
 
     /// Sets a dotted key (e.g. `page.top_cm`), keeping the value's existing type.
     pub fn set_value(&self, name: &str, key: &str, value: &str) -> Result<()> {
+        if key == "profile_name" {
+            bail!("'profile_name' cannot be changed; it is the file name");
+        }
         let cfg = self.load(name)?;
         let mut root = toml::Value::try_from(&cfg)?;
         let mut cur = &mut root;
@@ -206,8 +284,37 @@ impl ProfileStore {
             cur = slot;
         }
         let updated: ProfileConfig = root.try_into()?;
-        self.save(&updated)
+        self.write(&self.path(name)?, &updated)
     }
+
+    /// Sorted names of every `<name>.toml` profile in the directory.
+    pub fn list(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&self.dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                (p.extension()? == "toml").then(|| p.file_stem()?.to_str().map(String::from))?
+            })
+            .collect();
+        names.sort();
+        names
+    }
+}
+
+/// Decodes a text file saved as UTF-8 (with or without BOM) or UTF-16 LE with BOM; anything else lossily.
+fn decode_text(bytes: &[u8]) -> String {
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        let units: Vec<u16> = rest
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    String::from_utf8_lossy(bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes)).into_owned()
 }
 
 // WHY: the old value's type decides how the CLI string is parsed (float vs string vs list).
@@ -227,21 +334,4 @@ fn parse_like(old: &toml::Value, raw: &str) -> Result<toml::Value> {
 
 pub fn default_dir() -> &'static Path {
     Path::new("profiles")
-}
-
-impl ProfileStore {
-    /// Sorted names of every `<name>.toml` profile in the directory.
-    pub fn list(&self) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(&self.dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|e| {
-                let p = e.path();
-                (p.extension()? == "toml").then(|| p.file_stem()?.to_str().map(String::from))?
-            })
-            .collect();
-        names.sort();
-        names
-    }
 }

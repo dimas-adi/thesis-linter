@@ -76,3 +76,70 @@ fn foreign_terms_need_italic() {
     assert!(!pass);
     assert_eq!(viol_codes(&v), vec!["FOREIGN_TERM_NOT_ITALIC"]);
 }
+
+/// Paragraph of plain runs (no run properties), so only the text rules can fire.
+fn plain_para(runs: &str) -> String {
+    format!("<w:p><w:pPr><w:spacing w:line=\"360\" w:lineRule=\"auto\"/></w:pPr>{runs}</w:p>")
+}
+
+fn t(text: &str) -> String {
+    format!("<w:t xml:space=\"preserve\">{text}</w:t>")
+}
+
+#[test]
+fn tab_and_break_shapes_match_double_space_rule() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    let mut paras = Vec::new();
+    let mut kept = Vec::new();
+    for m in ["<w:tab/>", "<w:br/>", "<w:cr/>"] {
+        let (a, b) = (t("a "), t(" b"));
+        paras.push(plain_para(&format!("<w:r>{a}{m}{b}</w:r>")));
+        paras.push(plain_para(&format!(
+            "<w:r>{a}</w:r><w:r>{m}</w:r><w:r>{b}</w:r>"
+        )));
+        paras.push(plain_para(&format!("<w:r>{a}</w:r><w:r>{m}{b}</w:r>")));
+        kept.push(format!("{a}{m}{b}"));
+    }
+    let b = body(&paras);
+    let (_, v) = lint_body(d, &b, &[]);
+    assert!(viol_codes(&v).is_empty(), "{v}");
+    let (json, xml) = fix_body(d, &b);
+    assert!(json["remaining"].as_array().unwrap().is_empty());
+    for k in kept {
+        assert!(xml.contains(&k), "{k} in {xml}");
+    }
+}
+
+#[test]
+fn tabs_and_breaks_never_create_double_space() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut paras = Vec::new();
+    for m in ["<w:tab/>", "<w:br/>", "<w:cr/>"] {
+        paras.push(plain_para(&format!("<w:r>{}{m}{}</w:r>", t("a "), t("b"))));
+        paras.push(plain_para(&format!("<w:r>{}{m}{}</w:r>", t("a"), t(" b"))));
+        paras.push(plain_para(&format!(
+            "<w:r>{}</w:r><w:r>{m}</w:r><w:r>{}</w:r>",
+            t("a "),
+            t("b")
+        )));
+        paras.push(plain_para(&format!(
+            "<w:r>{}</w:r><w:r>{m}</w:r><w:r>{}</w:r>",
+            t("a"),
+            t(" b")
+        )));
+        paras.push(plain_para(&format!("<w:r>{m}{}</w:r>", t(" b"))));
+    }
+    let (_, v) = lint_body(tmp.path(), &body(&paras), &[]);
+    assert!(viol_codes(&v).is_empty(), "{v}");
+}
+
+#[test]
+fn many_empty_tab_runs_lint_quickly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runs = "<w:r><w:tab/></w:r>".repeat(80_000);
+    let start = std::time::Instant::now();
+    let (_, v) = lint_body(tmp.path(), &body(&[plain_para(&runs)]), &[]);
+    assert!(viol_codes(&v).is_empty(), "{v}");
+    assert!(start.elapsed().as_secs() < 5, "{:?}", start.elapsed());
+}
