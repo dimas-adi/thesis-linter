@@ -1,13 +1,28 @@
 //! Self-contained HTML report for a lint run.
 use crate::config::ProfileConfig;
+use crate::fixer;
 use crate::linter::Violation;
+use anyhow::{Context, Result};
 use std::collections::BTreeMap;
+use std::path::Path;
 
 fn esc(s: &str) -> String {
     // WHY: messages contain document text (font names etc.), so escape before embedding in HTML.
     crate::structure::escape_text(s)
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+/// Renders the report and writes it to `output`, refusing any spelling of the `input` file.
+pub fn write_html(
+    input: &Path,
+    output: &Path,
+    cfg: &ProfileConfig,
+    violations: &[Violation],
+) -> Result<()> {
+    fixer::ensure_distinct(input, output)?;
+    let page = render_html(&input.display().to_string(), cfg, violations);
+    std::fs::write(output, page).with_context(|| format!("writing {}", output.display()))
 }
 
 pub fn render_html(file: &str, cfg: &ProfileConfig, violations: &[Violation]) -> String {

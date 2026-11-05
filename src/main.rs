@@ -85,9 +85,7 @@ fn run(cli: Cli) -> Result<bool> {
             let cfg = store.resolve(profile.as_deref())?;
             let violations = linter::lint_file(&file, &cfg)?;
             if let Some(path) = &html {
-                fixer::ensure_distinct(&file, path)?;
-                let page = report::render_html(&file.display().to_string(), &cfg, &violations);
-                std::fs::write(path, page)?;
+                report::write_html(&file, path, &cfg, &violations)?;
             }
             // WHY: with --fix the exit code reflects what is left in the fixed copy.
             let remaining = match &fix {

@@ -51,6 +51,8 @@ pub struct DocxLintApp {
     pub status: String,
     /// Editable text of `profiles/foreign_terms.txt` (one word per line).
     pub dictionary_text: String,
+    /// Name the loaded profile has on disk; a different name in the Name box is a copy or a rename.
+    saved_name: String,
 }
 
 impl DocxLintApp {
@@ -62,10 +64,11 @@ impl DocxLintApp {
                 format!("Error: {e:#}"),
             ),
         };
-        let dictionary_text = store.load_dictionary().join("\n");
+        let dictionary_text = store.load_dictionary_text();
         let mut app = DocxLintApp {
             store,
             dictionary_text,
+            saved_name: profile.profile_name.clone(),
             profile,
             profile_names: Vec::new(),
             docx_path: None,
@@ -117,15 +120,34 @@ impl DocxLintApp {
             .collect()
     }
 
+    /// Re-lints the loaded document (if any) and shows `message`, followed by the lint status.
+    fn report_saved(&mut self, message: String) {
+        self.recheck();
+        self.status = if self.docx_path.is_some() {
+            format!("{message} {}", self.status)
+        } else {
+            message
+        };
+    }
+
     pub fn save_profile(&mut self) {
-        match self.store.save(&self.profile) {
+        let name = self.profile.profile_name.clone();
+        // WHY: a typed name that matches another profile would silently replace that file.
+        if name != self.saved_name && self.store.exists(&name) {
+            return self.error(anyhow::anyhow!(
+                "profile '{name}' already exists; choose another name"
+            ));
+        }
+        // WHY: the saved profile must be the one the next launch resolves.
+        match self
+            .store
+            .save(&self.profile)
+            .and_then(|()| self.store.set_active(&name))
+        {
             Ok(()) => {
+                self.saved_name = name.clone();
                 self.refresh_profiles();
-                self.recheck();
-                self.status = format!(
-                    "Saved profile '{}'. {}",
-                    self.profile.profile_name, self.status
-                );
+                self.report_saved(format!("Saved profile '{name}'."));
             }
             Err(e) => self.error(e),
         }
@@ -133,20 +155,18 @@ impl DocxLintApp {
 
     /// Writes `dictionary_text` to `foreign_terms.txt` and swaps the old words for the new ones.
     pub fn save_dictionary(&mut self) {
-        let old = self.store.load_dictionary();
         if let Err(e) = self.store.save_dictionary(&self.dictionary_text) {
             return self.error(e);
         }
-        let terms = &mut self.profile.academic.foreign_terms_must_italicize;
-        // WHY: drop only words that came from the old file so terms typed into the profile survive.
-        terms.retain(|t| !old.iter().any(|o| o.eq_ignore_ascii_case(t)));
-        for w in self.store.load_dictionary() {
-            if !terms.iter().any(|t| t.eq_ignore_ascii_case(&w)) {
-                terms.push(w);
-            }
-        }
-        self.recheck();
-        self.status = format!("Saved dictionary. {}", self.status);
+        let mut profile = self.profile.clone();
+        let added = std::mem::take(&mut profile.dictionary_added);
+        // WHY: drop only the words the old dictionary added, so terms in the profile survive.
+        profile
+            .academic
+            .foreign_terms_must_italicize
+            .retain(|t| !added.iter().any(|a| a.eq_ignore_ascii_case(t)));
+        self.profile = self.store.with_dictionary(profile);
+        self.report_saved("Saved dictionary.".to_string());
     }
 
     pub fn switch_profile(&mut self, name: &str) {
@@ -156,8 +176,13 @@ impl DocxLintApp {
             .and_then(|p| self.store.set_active(name).map(|()| p))
         {
             Ok(p) => {
+                self.saved_name = p.profile_name.clone();
                 self.profile = p;
+                self.refresh_profiles();
                 self.recheck();
+                if self.docx_path.is_none() {
+                    self.status = format!("Switched to '{name}'.");
+                }
             }
             Err(e) => self.error(e),
         }
@@ -167,6 +192,9 @@ impl DocxLintApp {
         let Some(input) = self.docx_path.clone() else {
             return self.error(anyhow::anyhow!("no document loaded"));
         };
+        if let Err(e) = self.profile.validate() {
+            return self.error(e);
+        }
         let result = fixer::fix_file(&input, out, &self.profile)
             .and_then(|()| linter::lint_file(out, &self.profile));
         match result {
@@ -185,14 +213,20 @@ impl DocxLintApp {
         let Some(input) = self.docx_path.clone() else {
             return self.error(anyhow::anyhow!("no document loaded"));
         };
-        let page = report::render_html(
-            &input.display().to_string(),
-            &self.profile,
-            &self.violations,
-        );
-        match std::fs::write(out, page) {
+        if let Err(e) = self.profile.validate() {
+            return self.error(e);
+        }
+        // WHY: the report must describe the file as it is now, never a cached or failed lint.
+        match linter::lint_file(&input, &self.profile) {
+            Ok(v) => self.violations = v,
+            Err(e) => {
+                self.violations.clear();
+                return self.error(e);
+            }
+        }
+        match report::write_html(&input, out, &self.profile, &self.violations) {
             Ok(()) => self.status = format!("Exported report {}", out.display()),
-            Err(e) => self.error(e.into()),
+            Err(e) => self.error(e),
         }
     }
 
@@ -270,7 +304,7 @@ impl DocxLintApp {
         ] {
             ui.horizontal(|ui| {
                 ui.label(label);
-                ui.add(egui::DragValue::new(val).speed(0.05).range(0.0..=10.0));
+                ui.add(egui::DragValue::new(val).speed(0.05).range(0.0..=f64::MAX));
             });
         }
         ui.separator();
@@ -313,11 +347,17 @@ impl DocxLintApp {
         });
         ui.separator();
         ui.label("Foreign-term dictionary (one word per line)");
-        ui.add(
-            egui::TextEdit::multiline(&mut self.dictionary_text)
-                .desired_rows(6)
-                .desired_width(f32::INFINITY),
-        );
+        // WHY: only the text box scrolls, so a long dictionary never pushes the Save buttons off screen.
+        egui::ScrollArea::vertical()
+            .id_salt("dictionary_scroll")
+            .max_height(150.0)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.dictionary_text)
+                        .desired_rows(6)
+                        .desired_width(f32::INFINITY),
+                );
+            });
         if ui.button("Save dictionary").clicked() {
             self.save_dictionary();
         }

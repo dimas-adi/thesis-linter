@@ -42,6 +42,9 @@ pub struct ProfileConfig {
     pub typography: TypographyConfig,
     pub structure: StructureConfig,
     pub academic: AcademicConfig,
+    /// Dictionary words that `ProfileStore::with_dictionary` merged into the foreign terms; never saved.
+    #[serde(skip)]
+    pub dictionary_added: Vec<String>,
 }
 
 impl ProfileConfig {
@@ -73,6 +76,9 @@ impl ProfileConfig {
             if v == 0.0 {
                 bail!("invalid value for '{name}': {v}");
             }
+        }
+        if t.font_name.trim().is_empty() {
+            bail!("invalid value for 'typography.font_name': must not be empty");
         }
         let s = &self.structure;
         for (name, v, allowed) in [
@@ -141,6 +147,7 @@ impl ProfileConfig {
                 .map(String::from)
                 .to_vec(),
             },
+            dictionary_added: Vec::new(),
         }
     }
 }
@@ -175,39 +182,47 @@ impl ProfileStore {
     fn write(&self, path: &Path, cfg: &ProfileConfig) -> Result<()> {
         cfg.validate()?;
         std::fs::create_dir_all(&self.dir)?;
-        // WHY: dictionary words were merged in on load; writing them back would duplicate the file's content.
-        let dict = self.load_dictionary();
-        // WHY: a term already in the file is the profile's own, even when the dictionary lists it too.
-        let on_disk: Vec<String> = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|t| toml::from_str::<ProfileConfig>(&t).ok())
-            .map(|c| c.academic.foreign_terms_must_italicize)
-            .unwrap_or_default();
+        // WHY: only the words the merge added are the dictionary's; a term the profile already had stays.
         let mut own = cfg.clone();
         own.academic.foreign_terms_must_italicize.retain(|t| {
-            on_disk.iter().any(|d| d.eq_ignore_ascii_case(t))
-                || !dict.iter().any(|d| d.eq_ignore_ascii_case(t))
+            !cfg.dictionary_added
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(t))
         });
         std::fs::write(path, toml::to_string_pretty(&own)?)
             .with_context(|| format!("writing {}", path.display()))
     }
 
-    pub fn load(&self, name: &str) -> Result<ProfileConfig> {
+    /// True when a profile file with this name exists; an invalid name never exists.
+    pub fn exists(&self, name: &str) -> bool {
+        self.path(name).is_ok_and(|p| p.exists())
+    }
+
+    /// Reads and validates the profile file only, without the dictionary.
+    fn load_raw(&self, name: &str) -> Result<ProfileConfig> {
         let path = self.path(name)?;
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("profile '{name}' not found at {}", path.display()))?;
         let cfg: ProfileConfig = toml::from_str(&text)?;
         cfg.validate()?;
-        Ok(self.with_dictionary(cfg))
+        Ok(cfg)
     }
 
-    fn with_dictionary(&self, mut cfg: ProfileConfig) -> ProfileConfig {
+    pub fn load(&self, name: &str) -> Result<ProfileConfig> {
+        Ok(self.with_dictionary(self.load_raw(name)?))
+    }
+
+    /// Merges dictionary words into the foreign terms and records which ones it added.
+    pub fn with_dictionary(&self, mut cfg: ProfileConfig) -> ProfileConfig {
         let terms = &mut cfg.academic.foreign_terms_must_italicize;
+        let mut added = Vec::new();
         for w in self.load_dictionary() {
             if !terms.iter().any(|t| t.eq_ignore_ascii_case(&w)) {
-                terms.push(w);
+                terms.push(w.clone());
+                added.push(w);
             }
         }
+        cfg.dictionary_added = added;
         cfg
     }
 
@@ -215,10 +230,14 @@ impl ProfileStore {
         self.dir.join("foreign_terms.txt")
     }
 
+    /// The whole decoded text of `foreign_terms.txt`, comments and blank lines included.
+    pub fn load_dictionary_text(&self) -> String {
+        std::fs::read(self.dictionary_path()).map_or_else(|_| String::new(), |b| decode_text(&b))
+    }
+
     /// Words from `foreign_terms.txt` (one per line; blank lines and `#` comments ignored).
     pub fn load_dictionary(&self) -> Vec<String> {
-        let text = std::fs::read(self.dictionary_path())
-            .map_or_else(|_| String::new(), |b| decode_text(&b));
+        let text = self.load_dictionary_text();
         text.lines()
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
@@ -265,7 +284,7 @@ impl ProfileStore {
         if key == "profile_name" {
             bail!("'profile_name' cannot be changed; it is the file name");
         }
-        let cfg = self.load(name)?;
+        let cfg = self.load_raw(name)?;
         let mut root = toml::Value::try_from(&cfg)?;
         let mut cur = &mut root;
         let mut parts = key.split('.').peekable();

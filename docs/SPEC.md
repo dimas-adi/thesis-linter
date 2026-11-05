@@ -93,7 +93,7 @@ State and isolation: tests write only inside `tempfile` directories, use no netw
 - **R-009:** An input that is not a zip, has no `word/document.xml`, has malformed XML, or has a `word/document.xml` larger than 64 MiB decompressed ends with an `error:` message on stderr and exit code 2, never a panic. *(existing test: hostile_archives_exit_2_without_panic)*
 
 ### Auto-fix
-- **R-010:** `--fix` and GUI Auto-Fix never modify the input `.docx`, including when the output path is another spelling of the same file; such a request is an error. `--html` never overwrites the input either. *(existing test: fix_never_modifies_input_bytes)*
+- **R-010:** `--fix` and GUI Auto-Fix never modify the input `.docx`, including when the output path is another spelling of the same file; such a request is an error. `--html` and GUI Export HTML never overwrite the input either. *(existing test: gui_outputs_cannot_overwrite_input)*
 - **R-011:** The fixed copy contains every other package entry of the input with identical decompressed content; only `word/document.xml` is rewritten. *(existing test: fix_preserves_other_package_entries_byte_for_byte)*
 - **R-012:** After `--fix`, re-linting reports no `MARGIN_ERROR`, `FONT_ERROR`, `SPACING_ERROR`, or `DOUBLE_SPACE_ERROR`, and XML entities in text stay escaped. *(existing test: fix_clears_fixable_violations_and_keeps_package_parts)*
 - **R-013:** `--fix` puts every non-italic foreign term in its own italic run, keeps the run's other formatting, and leaves the paragraph text unchanged. *(existing test: fixer_splits_runs_so_foreign_terms_become_italic)*
@@ -135,12 +135,12 @@ State and isolation: tests write only inside `tempfile` directories, use no netw
 ### Profiles
 - **R-040:** `config init`, `set`, `use`, and `show` persist to `<profiles-dir>/<name>.toml` and `active_profile.txt`. *(existing test: init_set_use_show_persist_to_profiles_dir)*
 - **R-041:** `config set` rejects an unknown key or a value of the wrong type, and `config use` rejects a missing profile. *(existing test: set_rejects_unknown_key_and_missing_profile_use)*
-- **R-059:** `config set`, `config init`, and loading reject values outside the Profile Schema (non-finite numbers, negative margins or tolerance, zero sizes or spacing, unknown enum values) with exit 2. *(existing test: config_set_rejects_values_outside_schema)*
+- **R-059:** `config set`, `config init`, and loading reject values outside the Profile Schema (non-finite numbers, negative margins or tolerance, zero sizes or spacing, unknown enum values) with exit 2. GUI Auto-Fix and GUI Export HTML apply the same checks, and an empty font name is rejected too. *(existing test: autofix_rejects_values_outside_schema)*
 - **R-060:** `config init` never replaces an existing profile. *(existing test: config_init_refuses_existing_profile)*
 - **R-042:** A profile name that is empty or contains `/`, `\`, `.`, `:`, `<`, `>`, `"`, `|`, `?`, `*`, or a control character is rejected, so a profile path never leaves the profiles directory. *(existing test: invalid_profile_names_are_rejected)*
 - **R-043:** Profile resolution order is the named profile, then the active profile, then built-in defaults named `default_kampus`. *(existing test: profile_drives_validation)*
 - **R-044:** A profile file written with the schema in Profile Schema keeps loading with the same values; keys are never renamed or removed. *(existing test: schema_profile_loads_with_same_values)*
-- **R-045:** Dictionary words merge into the foreign terms for CLI and GUI, ignoring blank lines and `#` comments, without duplicates, and are never written back into the `.toml`. *(existing test: external_dictionary_is_merged_for_cli_and_gui)*
+- **R-045:** Dictionary words merge into the foreign terms for CLI and GUI, ignoring blank lines and `#` comments, without duplicates, and are never written back into the `.toml`. The GUI dictionary box shows the whole file, so saving with no edit keeps its comments and blank lines. *(existing test: external_dictionary_is_merged_for_cli_and_gui)*
 - **R-046:** `--profiles-dir <dir>` replaces `./profiles` for every subcommand. *(existing test: profiles_dir_applies_to_every_subcommand)*
 
 ### HTML report
@@ -151,11 +151,14 @@ State and isolation: tests write only inside `tempfile` directories, use no netw
 - **R-049:** Loading a document fills `violations` and the status text. *(existing test: load_file_populates_violations_and_status)*
 - **R-050:** Loading a bad path clears `violations` and sets a status starting with `Error`. *(existing test: load_missing_file_sets_error_banner)*
 - **R-051:** Filter tabs partition the violations; a code outside Layout and Structure appears under Academic. *(existing test: filter_tabs_partition_violations)*
-- **R-052:** Saving a profile persists it and re-lints the loaded document. *(existing test: save_profile_persists_and_relints)*
+- **R-052:** Saving a profile persists it, makes it the active profile, and re-lints the loaded document. *(existing test: saved_profile_survives_restart)*
 - **R-053:** Switching profiles loads the profile and makes it active. *(existing test: switch_profile_loads_and_activates)*
 - **R-054:** Auto-Fix and Export HTML write their output files. *(existing test: autofix_and_export_html_write_files)*
 - **R-055:** Auto-Fix and Export HTML with no document set a status starting with `Error`. *(existing test: actions_without_document_report_error)*
-- **R-056:** Saving the dictionary replaces only words from the old dictionary; terms typed into the profile survive. *(not yet tested)*
+- **R-056:** Saving the dictionary replaces only words from the old dictionary; terms typed into the profile survive. *(existing test: save_dictionary_replaces_only_old_words)*
+- **R-061:** GUI Export HTML reports a fresh lint of the file, and a failed lint writes no report. *(existing test: export_html_never_reports_a_failed_or_stale_lint)*
+- **R-062:** GUI Save never replaces a different existing profile. *(existing test: save_refuses_to_replace_another_profile)*
+- **R-063:** Both Save buttons stay reachable with any dictionary length. *(existing test: save_buttons_stay_on_screen_with_long_dictionary)*
 
 ## Non-Goals
 - Checking anything other than `word/document.xml`: headers, footers, footnotes, and `styles.xml` are out of scope (D-002).

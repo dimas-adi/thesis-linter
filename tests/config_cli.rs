@@ -285,3 +285,17 @@ fn profiles_dir_applies_to_every_subcommand() {
     );
     assert!(!d.join("profiles").exists());
 }
+
+#[test]
+fn config_set_rejects_empty_font_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    assert!(run(d, &["config", "init", "p"]).status.success());
+    let file = d.join("profiles/p.toml");
+    let before = std::fs::read(&file).unwrap();
+    for value in ["", "   "] {
+        let out = run(d, &["config", "set", "p", "typography.font_name", value]);
+        assert_eq!(out.status.code(), Some(2), "{value:?}");
+        assert_eq!(std::fs::read(&file).unwrap(), before, "{value:?}");
+    }
+}
